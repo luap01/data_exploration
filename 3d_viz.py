@@ -3,11 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 
-def json_load(p):
-    with open(p, 'r') as fi:
-        d = json.load(fi)
-    return d
-
+from utils.files import json_load
 
 HAND_STRUCTURE = {
     "thumb": {

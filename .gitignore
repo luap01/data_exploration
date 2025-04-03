@@ -1,0 +1,6 @@
+.DS_Store
+data/
+pytorch-openpose-impl/pytorch-openpose/*
+pytorch-openpose-impl/output/*
+pytorch-openpose-impl/images/*
+pytorch-openpose-impl/model/*

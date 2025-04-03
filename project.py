@@ -2,6 +2,11 @@ import cv2
 import numpy as np
 import json
 import os
+from pathlib import Path
+
+from utils.camera import load_cam_infos, project_to_2d
+from utils.files import json_load, load_all_images, load_all_xyz
+from utils.image import undistort_image
 
 HAND_STRUCTURE = {
     "thumb": {
@@ -25,6 +30,21 @@ HAND_STRUCTURE = {
         "color": (255, 0, 255)  # Purple
     }
 }
+
+HAND_CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 4),      # Thumb
+        (0, 5), (5, 6), (6, 7), (7, 8),      # Index
+        (0, 9), (9, 10), (10, 11), (11, 12), # Middle
+        (0, 13), (13, 14), (14, 15), (15, 16), # Ring
+        (0, 17), (17, 18), (18, 19), (19, 20)  # Pinky
+]
+
+
+RED = (0, 0, 255)
+GREEN = (0, 255, 0)
+BLUE = (255, 0, 0)
+YELLOW = (0, 255, 255)
+
 
 def load_cam_params(path):
     K_list = json_load(path)
@@ -123,16 +143,11 @@ def visualize_openpose_keypoints(image_path, keypoints_left, keypoints_right, in
     if img is None:
         raise ValueError("Could not load image")
 
-    # Define colors (BGR format)
-    RED = (0, 0, 255)
-    GREEN = (0, 255, 0)
-    BLUE = (255, 0, 0)
-    YELLOW = (0, 255, 255)
 
 
     # Extract keypoints
     left_hand_keypoints = np.array(keypoints_left).reshape(-1, 3)
-    right_hand_keypoints = np.array(keypoints_right).reshape(-1, 3)
+    right_hand_keypoints = np.array(keypoints_right).reshape(-1, 3) if keypoints_right is not None else np.zeros((0, 3))
 
     CONF_LVL = 0.00001
     # Draw hand keypoints
@@ -153,14 +168,7 @@ def visualize_openpose_keypoints(image_path, keypoints_left, keypoints_right, in
     #                 finger_x, finger_y = int(keypoints[i][0]), int(keypoints[i][1])
     #                 cv2.line(img, (wrist_x, wrist_y), (finger_x, finger_y), GREEN, 1)
 
-    HAND_CONNECTIONS = [
-        (0, 1), (1, 2), (2, 3), (3, 4),      # Thumb
-        (0, 5), (5, 6), (6, 7), (7, 8),      # Index
-        (0, 9), (9, 10), (10, 11), (11, 12), # Middle
-        (0, 13), (13, 14), (14, 15), (15, 16), # Ring
-        (0, 17), (17, 18), (18, 19), (19, 20)  # Pinky
-    ]
-        
+    
     # Draw connections for left hand
     for idx1, idx2 in HAND_CONNECTIONS:
         if (left_hand_keypoints[idx1][2] > CONF_LVL and left_hand_keypoints[idx2][2] > CONF_LVL):
@@ -178,7 +186,7 @@ def visualize_openpose_keypoints(image_path, keypoints_left, keypoints_right, in
     # Display and save the result
     cv2.imshow("OpenPose Visualization", img)
     cv2.waitKey(0)
-    cv2.imwrite(f"./output/openpose_result_{index}.jpg", img)
+    cv2.imwrite(image_path.replace("input", "output"), img)
     # cv2.destroyAllWindows()
 
 
@@ -252,7 +260,6 @@ def project_3d_to_2d_alt(xyz, intrinsics, extrinsics):
     return np.column_stack((x_img, y_img))
 
 
-
 def update_intrinsics_from_fov(intrinsics, image_width, image_height):
     fx = intrinsics[0, 0]
     fy = intrinsics[1, 1]
@@ -265,12 +272,6 @@ def update_intrinsics_from_fov(intrinsics, image_width, image_height):
         intrinsics[0, 0] = fx
         intrinsics[1, 1] = fy
     return intrinsics
-
-
-def json_load(p):
-    with open(p, 'r') as fi:
-        d = json.load(fi)
-    return d
 
 
 def invert_extrinsics(extrinsics):
@@ -320,26 +321,146 @@ def project_3d_to_2d_distortion(xyz, K_camera, M_camera, distCoeffs):
     return image_points.reshape(-1, 2)
 
 
+
+
+def test_run(kps, cam_params, colour, dir, img, idx):
+    points_2d = []
+    for i, point_3d in enumerate(kps):
+            # Project 3D point to 2D image coordinates
+            point_2d = project_to_2d(
+                point_3d, cam_params["intrinsics"], np.linalg.inv(cam_params["extrinsics"])
+            )
+
+            # Save the 2D point
+            points_2d.append((int(point_2d[0]), int(point_2d[1])))
+
+            # Draw the point on the image
+            cv2.circle(
+                img,
+                (int(point_2d[0]), int(point_2d[1])),
+                10,
+                colour,
+                thickness=-1,
+            )
+
+    # cv2.imshow("OpenPose Visualization", img)
+    # cv2.waitKey(0)
+    cv2.imwrite(f"./output/images/test/cam{idx}_direction_{dir}.jpg", img)
+    # cv2.destroyAllWindows()
+
+    print("Projected 2D points for cam", idx, "in direction", dir, ":\n", points_2d)
+    return points_2d
+
+
+def tony_proj_function_test_run():
+    all_cam_params = load_cam_infos(Path("../HaMuCo/data/OR"))
+    for i in range(len(all_cam_params)):
+        cam_idx = i + 1
+        cam_params = all_cam_params[f'camera0{cam_idx}']
+
+        x_kps = np.array([[-1, 0, 0], [0, 0, 0], [1, 0, 0]])
+        y_kps = np.array([[0, -1, 0], [0, 0, 0], [0, 1, 0]])
+        z_kps = np.array([[0, 0, -1], [0, 0, 0], [0, 0, 1]])
+
+        img = cv2.imread(f"./input/cam{cam_idx}_000000.jpg")
+        img = undistort_image(img, cam_params, 'color')
+        test_run(x_kps, cam_params, (0, 0, 255), "x", img, cam_idx)
+        img = cv2.imread(f"./input/cam{cam_idx}_000000.jpg")
+        img = undistort_image(img, cam_params, 'color')
+        test_run(y_kps, cam_params, (0, 255, 0), "y", img, cam_idx)
+        img = cv2.imread(f"./input/cam{cam_idx}_000000.jpg")
+        img = undistort_image(img, cam_params, 'color')
+        test_run(z_kps, cam_params, (255, 0, 0), "z", img, cam_idx)
+
+
+def assemble_2d_points(_3d_points, cam_params):
+    points_2d = []
+    for i, point_3d in enumerate(_3d_points):
+        point_2d = project_to_2d(
+            point_3d, cam_params["intrinsics"], np.linalg.inv(cam_params["extrinsics"])
+        )
+        points_2d.append((int(point_2d[0]), int(point_2d[1])))
+    return points_2d
+
+def visualize_2d_points(points_2d, img, dot_colour, line_colour):
+   for i, (x, y) in enumerate(points_2d):
+        cv2.circle(img, (int(x), int(y)), 4, dot_colour, -1)
+
+   for idx1, idx2 in HAND_CONNECTIONS:
+        x1, y1 = int(points_2d[idx1][0]), int(points_2d[idx1][1])
+        x2, y2 = int(points_2d[idx2][0]), int(points_2d[idx2][1])
+        cv2.line(img, (x1, y1), (x2, y2), line_colour, 1)
+
+
 if __name__ == "__main__":
-    img = cv2.imread("./000000.jpg")
+    img = cv2.imread("./data/input/cam1_000000.jpg")
     height, width = img.shape[:2]
     print(f"Image size: {width}x{height}")
 
-    keypoints = json_load("./json/camera01_000000_keypoints.json")
-    openpose_left = np.array(keypoints['people'][0]['hand_left_keypoints_2d']).reshape(-1, 3)
-    openpose_right = np.array(keypoints['people'][0]['hand_right_keypoints_2d']).reshape(-1, 3)
+
+    # tony_proj_function_test_run()
+    # keypoints = json_load("./openpose/json/camera01_000000_keypoints.json")
+    # visualize_openpose_keypoints("./input/cam1_000000.jpg", keypoints['people'][0]['hand_left_keypoints_2d'], keypoints['people'][0]['hand_right_keypoints_2d'], 0)
+    # keypoints = json_load("./openpose/json/camera02_000000_keypoints.json")
+    # visualize_openpose_keypoints("./input/cam2_000000.jpg", keypoints['people'][0]['hand_left_keypoints_2d'], keypoints['people'][0]['hand_right_keypoints_2d'], 0)
+    # keypoints = json_load("./openpose/json/camera03_000000_keypoints.json")
+    # visualize_openpose_keypoints("./input/cam3_000000.jpg", keypoints['people'][0]['hand_left_keypoints_2d'], keypoints['people'][0]['hand_right_keypoints_2d'], 0)
+    # keypoints = json_load("./openpose/json/camera04_000000_keypoints.json")
+    # visualize_openpose_keypoints("./input/cam4_000000.jpg", keypoints['people'][0]['hand_left_keypoints_2d'], keypoints['people'][0]['hand_right_keypoints_2d'], 0)
+
+    # openpose_left = np.array(keypoints['people'][0]['hand_left_keypoints_2d']).reshape(-1, 3)
+    # openpose_right = np.array(keypoints['people'][0]['hand_right_keypoints_2d']).reshape(-1, 3)
     # print("OpenPose Left 2D sample:\n", openpose_left[:5])
     # visualize_openpose_keypoints("./000000.jpg", keypoints['people'][0]['hand_left_keypoints_2d'], keypoints['people'][0]['hand_right_keypoints_2d'], 0)
 
+
+    all_views = load_all_images(Path("./data/input"))
+    all_xyz = load_all_xyz(Path("./data/output/xyz/"))
+    all_cam_params = load_cam_infos(Path("../HaMuCo/data/OR"))
+    iteration = len(os.listdir("./data/output/images/test/")) // len(all_views.keys())
+    for cam_idx in all_views.keys():
+        cam_params = all_cam_params[cam_idx]
+        img = all_views[cam_idx]
+        img = undistort_image(img, cam_params, 'color')
+
+        left_xyz = all_xyz["left"]
+        right_xyz = all_xyz["right"]
+
+        left_2d = assemble_2d_points(left_xyz, cam_params)
+        right_2d = assemble_2d_points(right_xyz, cam_params)
+        
+        visualize_2d_points(left_2d, img, dot_colour=RED, line_colour=GREEN)
+        visualize_2d_points(right_2d, img, dot_colour=BLUE, line_colour=YELLOW)
+    
+        cv2.imwrite(f"./data/output/images/test/{iteration}_2d_points_{cam_idx}.jpg", img)
+        
+        
     # left_xyz = np.array(json_load("./xyz/left/000000.json"))
     # right_xyz = np.array(json_load("./xyz/right/000000.json"))
+    # cam_params = load_cam_params("../HaMuCo/data/OR/calib/camera01.json")
+    
 
-    left_xyz = np.array(json_load("./xyz_left_000000.json"))
-    right_xyz = np.array(json_load("./xyz_right_000000.json"))
+    # left_2d = assemble_2d_points(left_xyz, cam_params)
+    # right_2d = assemble_2d_points(right_xyz, cam_params)
+
+    # print("Left 2D points:\n", left_2d[:5])
+    # print("Right 2D points:\n", right_2d[:5])
+
+    # visualize_2d_points(left_2d, img, dot_colour=RED, line_colour=GREEN)
+    # visualize_2d_points(right_2d, img, dot_colour=BLUE, line_colour=YELLOW)
+    # cv2.imshow("2D Points", img)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+    # cv2.imwrite("./output/images/test/2d_points.jpg", img)
+    # left_xyz = np.array(json_load("./xyz_left_000000.json"))
+    # right_xyz = np.array(json_load("./xyz_right_000000.json"))
 
     # left_xyz = np.array(json_load("./left_3d.json"))
     # right_xyz = np.array(json_load("./right_3d.json"))
-    cam_params = load_cam_params("../HaMuCo/data/OR/calib/camera01.json")
+
+    # xyz_homogeneous = np.hstack((left_xyz[0:1], np.ones((1, 1))))
+    # cam_coords = cam_params['extrinsics'] @ xyz_homogeneous.T
+    # print("Camera Z:", cam_coords[2])
 
     # left_xyz[:, 2] = -left_xyz[:, 2]  # e.g., -1.89 → 1.89
     # right_xyz[:, 2] = -right_xyz[:, 2]
@@ -362,21 +483,24 @@ if __name__ == "__main__":
     # print("Determinant of R:", np.linalg.det(R))  # Should be ~1
     # print("Pre Transformation Intrinsics:\n", cam_params['intrinsics'])
 
-    cam_params['intrinsics'][0, 2] += 1000  # Adjust cx
+    # cam_params['intrinsics'][0, 2] += 1000  # Adjust cx
     # cam_params['intrinsics'] = update_intrinsics_from_fov(cam_params['intrinsics'], width, height)
     
     # cam_params['extrinsics'] = invert_extrinsics(cam_params['extrinsics'])
-
-
-    # Project 3D points to 2D
-    left_2d = project_3d_to_2d_distortion(left_xyz, cam_params['intrinsics'], cam_params['extrinsics'], cam_params['distortion'])
-    right_2d = project_3d_to_2d_distortion(right_xyz, cam_params['intrinsics'], cam_params['extrinsics'], cam_params['distortion'])
-    print("Left 2D points:\n", left_2d[:5])
-    print("Right 2D points:\n", right_2d[:5])
+    
 
     
-    # Add a dummy confidence value to match OpenPose format (x, y, conf)
-    left_2d_conf = np.hstack((left_2d, np.ones((left_2d.shape[0], 1))))  # Shape: (21, 3)
-    right_2d_conf = np.hstack((right_2d, np.ones((right_2d.shape[0], 1))))  #
 
-    visualize_openpose_keypoints("./000000.jpg", left_2d_conf, right_2d_conf, 1)
+    # Project 3D points to 2D
+    # left_2d = project_3d_to_2d_distortion(left_xyz, cam_params['intrinsics'], cam_params['extrinsics'], cam_params['distortion'])
+    # right_2d = project_3d_to_2d_distortion(right_xyz, cam_params['intrinsics'], cam_params['extrinsics'], cam_params['distortion'])
+    # print("Left 2D points:\n", left_2d[:5])
+    # print("Right 2D points:\n", right_2d[:5])
+
+
+    
+    # # Add a dummy confidence value to match OpenPose format (x, y, conf)
+    # left_2d_conf = np.hstack((left_2d, np.ones((left_2d.shape[0], 1))))  # Shape: (21, 3)
+    # right_2d_conf = np.hstack((right_2d, np.ones((right_2d.shape[0], 1))))  #
+
+    # visualize_openpose_keypoints("./input/cam1_000000.jpg", left_2d_conf, right_2d_conf, 1)
