@@ -109,7 +109,7 @@ def rotation_to_homogenous(vec):
     return swap
 
 
-def load_cam_infos(take_path: Path) -> dict:
+def load_cam_infos(take_path: Path, orbbec: bool = True) -> dict:
     """
     Load and process camera calibration information from JSON files in a directory.
 
@@ -142,7 +142,7 @@ def load_cam_infos(take_path: Path) -> dict:
     to align with a specific coordinate system convention.
     """
     camera_parameters = {}
-    camera_paths = sorted((take_path / "calib").glob('camera*.json'))[:4]
+    camera_paths = sorted((take_path / "calib").glob('camera*.json'))[:4] if orbbec else sorted((take_path / "calib").glob('camera*.json'))[4:]
 
     for cam_id, camera_path in enumerate(camera_paths, start=1):
         with camera_path.open() as f:
