@@ -118,6 +118,8 @@ def load_cam_infos(take_path: Path, orbbec: bool = True) -> dict:
     take_path : Path
         Path to the directory containing a 'calibration' subdirectory with camera
         calibration JSON files named 'camera*.json'.
+    orbbec : bool
+        If True, load first 4 cameras (Orbbec), if False load remaining cameras.
 
     Returns
     -------
@@ -142,13 +144,22 @@ def load_cam_infos(take_path: Path, orbbec: bool = True) -> dict:
     to align with a specific coordinate system convention.
     """
     camera_parameters = {}
-    camera_paths = sorted((take_path / "calib").glob('camera*.json'))[:4] if orbbec else sorted((take_path / "calib").glob('camera*.json'))[4:]
-
-    for cam_id, camera_path in enumerate(camera_paths, start=1):
+    cam_lst = sorted((take_path / "calib").glob('camera*.json'))
+    camera_paths = cam_lst[:4] if orbbec else cam_lst[4:]
+    
+    start_idx = 1 if orbbec else 5
+    for cam_id, camera_path in enumerate(camera_paths, start=start_idx):
         with camera_path.open() as f:
             cam_info = json.load(f)['value0']
 
-        intrinsics = extract_intrinsics_matrix(cam_info['color_parameters']['intrinsics_matrix'])
+        # Handle both color and depth-only cameras
+        if 'color_parameters' in cam_info:
+            params = cam_info['color_parameters']
+            intrinsics = extract_intrinsics_matrix(params['intrinsics_matrix'])
+        else:
+            params = cam_info['depth_parameters']
+            intrinsics = extract_intrinsics_matrix(params['intrinsics_matrix'])
+
         intrinsics[2, 1] = 0
         intrinsics[2, 2] = 1
         extrinsics = load_transform_matrix(cam_info['camera_pose']['translation'], cam_info['camera_pose']['rotation'])
@@ -164,20 +175,21 @@ def load_cam_infos(take_path: Path, orbbec: bool = True) -> dict:
             YZ_SWAP = rotation_to_homogenous(np.pi/2 * np.array([1, 0, 0]))
 
             extrinsics = YZ_SWAP @ extrinsics @ YZ_FLIP
+        else:
+            depth_extrinsics = extrinsics
 
-        color_params = cam_info['color_parameters']
-        radial_params = tuple(color_params['radial_distortion'].values())
-        tangential_params = tuple(color_params['tangential_distortion'].values())
+        radial_params = tuple(params['radial_distortion'].values())
+        tangential_params = tuple(params['tangential_distortion'].values())
 
         camera_parameters[f'camera0{cam_id}'] = {
             'intrinsics': intrinsics,
             'extrinsics': extrinsics,
-            'fov_x': color_params['fov_x'],
-            'fov_y': color_params['fov_y'],
-            'c_x': color_params['c_x'],
-            'c_y': color_params['c_y'],
-            'width': color_params['width'],
-            'height': color_params['height'],
+            'fov_x': params['fov_x'],
+            'fov_y': params['fov_y'],
+            'c_x': params['c_x'],
+            'c_y': params['c_y'],
+            'width': params['width'],
+            'height': params['height'],
             'radial_params': radial_params,
             'tangential_params': tangential_params,
             'depth_extrinsics': depth_extrinsics
