@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 
 from utils.camera import load_cam_infos, project_to_2d
-from utils.files import json_load, load_all_images, load_all_xyz
+from utils.files import json_load, load_all_images, load_all_xyz, load_all_keypoints
 from utils.image import undistort_image
+from scipy.spatial.transform import Rotation
+
 
 HAND_STRUCTURE = {
     "thumb": {
@@ -393,9 +395,9 @@ def visualize_2d_points(points_2d, img, dot_colour, line_colour):
 
 
 if __name__ == "__main__":
-    img = cv2.imread("./data/input/cam1_000000.jpg")
-    height, width = img.shape[:2]
-    print(f"Image size: {width}x{height}")
+    # img = cv2.imread("./data/input/cam1_000000.jpg")
+    # height, width = img.shape[:2]
+    # print(f"Image size: {width}x{height}")
 
 
     # tony_proj_function_test_run()
@@ -413,26 +415,63 @@ if __name__ == "__main__":
     # print("OpenPose Left 2D sample:\n", openpose_left[:5])
     # visualize_openpose_keypoints("./000000.jpg", keypoints['people'][0]['hand_left_keypoints_2d'], keypoints['people'][0]['hand_right_keypoints_2d'], 0)
 
+    input_base_pth = "./data/input/openpose/images/"
+    keypoints_base_pth = "./data/output/openpose/json/"
+    hamuco_base_pth = "../HaMuCo/data/OR"
+    all_images = load_all_images(Path(input_base_pth))
+    # all_xyz = load_all_xyz(Path(hamuco_base_pth + "/xyz/"))
 
-    all_views = load_all_images(Path("./data/input"))
-    all_xyz = load_all_xyz(Path("./data/output/xyz/"))
-    all_cam_params = load_cam_infos(Path("../HaMuCo/data/OR"))
-    iteration = len(os.listdir("./data/output/images/test/")) // len(all_views.keys())
-    for cam_idx in all_views.keys():
-        cam_params = all_cam_params[cam_idx]
-        img = all_views[cam_idx]
-        img = undistort_image(img, cam_params, 'color')
+    all_keypoints = load_all_keypoints(Path(keypoints_base_pth))
+    all_cam_params = load_cam_infos(Path(hamuco_base_pth), both=True)
+    iteration = len(os.listdir("./data/output/images/test/")) // 6
+    i = 0
+    for image in all_images.keys():
+        if i == 0:
+            i += iteration
+            prev_cam = image.split("/")[-2]
 
-        left_xyz = all_xyz["left"]
-        right_xyz = all_xyz["right"]
+        if image.split("/")[-2] != prev_cam:
+            i = 0
+            prev_cam = image.split("/")[-2]
 
-        left_2d = assemble_2d_points(left_xyz, cam_params)
-        right_2d = assemble_2d_points(right_xyz, cam_params)
+        cam_idx = image.split("/")[-2]
+        kpt_idx = image.replace(".jpg", ".json")
+
+        if "camera05" not in image:
+            continue
         
+        if cam_idx == "camera05":
+            image = image.replace("camera05", "camera01")
+            cam_idx = "camera01"
+
+        cam_params = all_cam_params[cam_idx]        
+        img = all_images[image]
+        img = undistort_image(img, cam_params, 'color', orbbec=False if "5" in cam_idx or "6" in cam_idx else True)
+
+        # left_xyz = all_xyz["left"]
+        # right_xyz = all_xyz["right"]
+
+        # left_2d = assemble_2d_points(left_xyz, cam_params)
+        # right_2d = assemble_2d_points(right_xyz, cam_params)
+        
+        left_2d = np.array(all_keypoints[kpt_idx]['people'][0]['hand_left_keypoints_2d']).reshape(-1, 3)[:, :2]
+        right_2d = np.array(all_keypoints[kpt_idx]['people'][0]['hand_right_keypoints_2d']).reshape(-1, 3)[:, :2]
+
+        # Create 2D rotation matrix for 90 degree rotation
+        theta = np.radians(-90)  # Convert -90 degrees to radians
+        c, s = np.cos(theta), np.sin(theta)
+        R_2d = np.array([[c, -s], [s, c]])
+        
+        # Apply rotation to points
+        left_2d = (R_2d @ left_2d.T).T
+        right_2d = (R_2d @ right_2d.T).T
+
         visualize_2d_points(left_2d, img, dot_colour=RED, line_colour=GREEN)
         visualize_2d_points(right_2d, img, dot_colour=BLUE, line_colour=YELLOW)
     
-        cv2.imwrite(f"./data/output/images/test/{iteration}_2d_points_{cam_idx}.jpg", img)
+        cv2.imwrite(f"./data/output/images/proj/{i}_{cam_idx}_{kpt_idx.split('/')[-1].split('.')[0]}.jpg", img)
+
+        i += 1
         
         
     # left_xyz = np.array(json_load("./xyz/left/000000.json"))
