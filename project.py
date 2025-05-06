@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from utils.camera import load_cam_infos, project_to_2d
+from utils.camera import load_cam_infos, project_to_2d, load_projection_matrix
 from utils.files import json_load, load_all_images, load_all_xyz, load_all_keypoints
 from utils.image import undistort_image
 from scipy.spatial.transform import Rotation
@@ -394,12 +394,58 @@ def visualize_2d_points(points_2d, img, dot_colour, line_colour):
         cv2.line(img, (x1, y1), (x2, y2), line_colour, 1)
 
 
+def project_3d_to_2d_from_projection_matrix(xyz, projection_matrix):
+    """
+    Projects 3D points (xyz) to 2D image plane using a projection matrix.
+    
+    Args:
+        xyz: (N, 3) array of 3D points
+        projection_matrix: (3, 4) projection matrix
+    Returns:
+        projected_points_2d: (N, 2) array of 2D pixel coordinates
+    """
+    projected_points_2d = []
+    for point_3d in xyz:
+        point_3d_homo = np.append(point_3d, 1)  # Convert to homogeneous coordinates [X, Y, Z, 1]
+        projected_point = projection_matrix @ point_3d_homo
+        projected_point = projected_point[:2] / projected_point[2]
+        projected_points_2d.append((int(projected_point[0]), int(projected_point[1])))
+
+    return projected_points_2d
+
+
+
 if __name__ == "__main__":
     # img = cv2.imread("./data/input/cam1_000000.jpg")
     # height, width = img.shape[:2]
     # print(f"Image size: {width}x{height}")
 
+    for i in range(30):
+        for cam_idx in range(1, 5):
+            img_idx = str(i).zfill(6)
+            img = cv2.imread(f"./data/input/openpose/images/camera0{cam_idx}/{img_idx}.jpg")
+            left_xyz = np.array(json_load(f"./data/output/xyz/left/{img_idx}.json"))
+            right_xyz = np.array(json_load(f"./data/output/xyz/right/{img_idx}.json"))
 
+            cam_params = load_cam_infos(Path("../HaMuCo/data/OR/"))
+            proj_matrices = load_projection_matrix(cam_params)
+
+            img = undistort_image(img, cam_params[f'camera0{cam_idx}'], 'color', orbbec=True)
+            left_2d = project_3d_to_2d_from_projection_matrix(left_xyz, proj_matrices[f'camera0{cam_idx}'])
+            right_2d = project_3d_to_2d_from_projection_matrix(right_xyz, proj_matrices[f'camera0{cam_idx}'])
+
+            # left_2d = assemble_2d_points(left_xyz, cam_params[f'camera0{cam_idx}'])
+            # right_2d = assemble_2d_points(right_xyz, cam_params[f'camera0{cam_idx}'])
+
+            visualize_2d_points(left_2d, img, dot_colour=RED, line_colour=GREEN)
+            visualize_2d_points(right_2d, img, dot_colour=BLUE, line_colour=YELLOW)
+
+            cv2.imshow("2D Points", img)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+
+    
+    
     # tony_proj_function_test_run()
     # keypoints = json_load("./openpose/json/camera01_000000_keypoints.json")
     # visualize_openpose_keypoints("./input/cam1_000000.jpg", keypoints['people'][0]['hand_left_keypoints_2d'], keypoints['people'][0]['hand_right_keypoints_2d'], 0)

@@ -185,6 +185,10 @@ def load_cam_infos(take_path: Path, orbbec: bool = True, both: bool = False) -> 
 
             extrinsics = YZ_SWAP @ extrinsics @ YZ_FLIP
         else:
+            T_marshall_orbbec = np.eye(4)
+            T_marshall_orbbec[:3, :3] = Rotation.from_euler("x", 90, degrees=True).as_matrix()
+            extrinsics = np.linalg.inv(extrinsics)
+            extrinsics = T_marshall_orbbec @ extrinsics
             depth_extrinsics = extrinsics
 
         radial_params = tuple(params['radial_distortion'].values())

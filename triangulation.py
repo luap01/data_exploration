@@ -3,80 +3,16 @@ import numpy as np
 import json
 import os
 from pathlib import Path
+import random
 
-from utils.camera import load_cam_infos, load_projection_matrix
+from utils.camera import load_cam_infos, load_projection_matrix, project_to_2d
 from utils.move import json_load, save_file
 from utils.image import undistort_image
 from utils.files import load_all_keypoints
 
-# def load_cam_params(path):
-#     K_list = json_load(path)
-#     color_params = K_list["value0"]["color_parameters"]
-#     fx = color_params["fov_x"]
-#     fy = color_params["fov_y"]
-#     cx = color_params["c_x"]
-#     cy = color_params["c_y"]
-#     intrinsics = np.array([
-#         [fx, 0,  cx],
-#         [0,  fy, cy],
-#         [0,  0,   1]
-#     ], dtype=np.float32)
 
-#     camera_pose = K_list["value0"]["camera_pose"]
-#     t = camera_pose["translation"]
-#     r = camera_pose["rotation"]
-#     tx = t["m00"]
-#     ty = t["m10"]
-#     tz = t["m20"]
-#     qx = r["x"]
-#     qy = r["y"]
-#     qz = r["z"]
-#     qw = r["w"]
-
-#     # Convert quaternion to a 3x3 rotation matrix
-#     r00 = 1 - 2 * (qy**2 + qz**2)
-#     r01 = 2 * (qx*qy - qz*qw)
-#     r02 = 2 * (qx*qz + qy*qw)
-
-#     r10 = 2 * (qx*qy + qz*qw)
-#     r11 = 1 - 2 * (qx**2 + qz**2)
-#     r12 = 2 * (qy*qz - qx*qw)
-
-#     r20 = 2 * (qx*qz - qy*qw)
-#     r21 = 2 * (qy*qz + qx*qw)
-#     r22 = 1 - 2 * (qx**2 + qy**2)
-
-#     rotation_matrix = np.array([
-#         [r00, r01, r02],
-#         [r10, r11, r12],
-#         [r20, r21, r22]
-#     ])
-
-#     # Build the 4x4 extrinsics matrix
-#     extrinsic = np.eye(4)
-#     extrinsic[:3, :3] = rotation_matrix
-#     extrinsic[:3, 3] = [tx, ty, tz]
-
-#     radial = color_params["radial_distortion"]
-#     tangential = color_params["tangential_distortion"]
-
-#     distCoeffs = np.array([
-#     radial["m00"],       # k1
-#     radial["m10"],       # k2
-#     tangential["m00"],   # p1
-#     tangential["m10"],   # p2
-#     radial["m20"]        # k3
-#     ], dtype=np.float32)
-    
-#     params = {}
-#     params['intrinsics'] = intrinsics
-#     params['extrinsics'] = extrinsic
-#     params['rotation'] = rotation_matrix
-#     params['distortion'] = distCoeffs
-#     return params
-
-def load_cam_params(path):
-    return load_cam_infos(path)
+def load_cam_params(path, orbbec: bool = True, both: bool = False):
+    return load_cam_infos(path, orbbec, both)
 
 def triangulate_multiview(proj_matrices, points):
     """
@@ -202,11 +138,25 @@ def triangulate_points_dlt(points_2d_cameras, camera_params_dict):
     return np.array(points_3d)
 
 
+def distance(point_2d_observed, point_2d_projected):
+    """
+    Compute Euclidean distance between observed and projected 2D points.
+    
+    Args:
+        point_2d_observed: Observed 2D point [x, y].
+        point_2d_projected: Projected 2D point [x, y].
+    
+    Returns:
+        Euclidean distance.
+    """
+    return np.sqrt(np.sum((point_2d_observed - point_2d_projected) ** 2))
+
 
 def triangulate_point(keypoints_2d, projection_matrices):
     A = []
     for i, (x, y) in enumerate(keypoints_2d):
-        P = projection_matrices[f'camera0{i+1}']
+        # P = projection_matrices[f'camera0{i+1}']
+        P = projection_matrices[i]
         A.append(x * P[2] - P[0])
         A.append(y * P[2] - P[1])
     A = np.array(A)
@@ -216,13 +166,65 @@ def triangulate_point(keypoints_2d, projection_matrices):
     return X[:3]  # Return (X, Y, Z)
 
 
+
+def ransac_triangulation(points_2d, projection_matrices, camera_params, max_iterations, threshold):
+    """
+    Perform RANSAC triangulation to estimate a 3D point robustly.
+    
+    Args:
+        points_2d: List of 2D points [x, y] from multiple cameras.
+        projection_matrices: List of 3x4 projection matrices.
+        max_iterations: Number of RANSAC iterations.
+        threshold: Reprojection error threshold in pixels.
+    
+    Returns:
+        best_3d_point: Estimated 3D point [x, y, z].
+        best_inliers: Indices of inlier views.
+    """
+    best_inliers = []
+    best_3d_point = None
+    best_responding_cam_idx = []
+    
+    for _ in range(max_iterations):
+        # Randomly select two views
+        indices = random.sample(range(len(points_2d)), 2)
+        sampled_points = [points_2d[i] for i in indices]
+        sampled_cameras = [projection_matrices[f'camera0{i+1}'] for i in indices]
+        
+        # Triangulate 3D point
+        point_3d = triangulate_point(sampled_points, sampled_cameras)
+        
+        # Count inliers
+        inliers = []
+        responding_cam_idx = []
+        for i in range(len(points_2d)):
+            projected_2d = project_to_2d(point_3d, camera_params[f'camera0{i+1}']['intrinsics'], np.linalg.inv(camera_params[f'camera0{i+1}']['extrinsics']) if i < 4 else camera_params[f'camera0{i+1}']['extrinsics'])
+            error = distance(projected_2d, points_2d[i])
+            if error < threshold:
+                inliers.append(i)
+                responding_cam_idx.append(f'camera0{i+1}')
+        
+        # Update best model
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+            best_3d_point = point_3d
+            best_responding_cam_idx = responding_cam_idx
+
+    # Refine using all inliers
+    if best_inliers:
+        best_3d_point = triangulate_point([points_2d[i] for i in best_inliers], [projection_matrices[cam_idx] for cam_idx in best_responding_cam_idx])
+    
+    return best_3d_point, best_inliers
+
+
+
 def validate_triangulation(point_3d, keypoints_2d, projection_matrices):
     reprojection_errors = []
     point_3d_homo = np.append(point_3d, 1)  # Convert to homogeneous coordinates [X, Y, Z, 1]
-
+    
     for i, (x_orig, y_orig) in enumerate(keypoints_2d):
         P = projection_matrices[f'camera0{i+1}']
-        
+
         # Project 3D point back to 2D
         point_2d_homo = P @ point_3d_homo  # [x', y', w']
         point_2d = point_2d_homo[:2] / point_2d_homo[2]  # Normalize by w' to get [x, y]
@@ -232,29 +234,71 @@ def validate_triangulation(point_3d, keypoints_2d, projection_matrices):
         error = np.sqrt((x_orig - x_reproj)**2 + (y_orig - y_reproj)**2)
         reprojection_errors.append(error)
         
-        print(f"Camera {i+1}: Original ({x_orig:.2f}, {y_orig:.2f}), "
-              f"Reprojected ({x_reproj:.2f}, {y_reproj:.2f}), Error: {error:.2f} pixels")
+        # print(f"Camera {i+1}: Original ({x_orig:.2f}, {y_orig:.2f}), "
+        #       f"Reprojected ({x_reproj:.2f}, {y_reproj:.2f}), Error: {error:.2f} pixels")
 
     mean_error = np.mean(reprojection_errors)
-    print(f"Mean reprojection error: {mean_error:.2f} pixels")
+    # print(f"Mean reprojection error: {mean_error:.2f} pixels")
     return mean_error, reprojection_errors
 
 
-if __name__ == "__main__":
-    all_cam_params = load_cam_params(Path("../HaMuCo/data/OR"))
+def cv2_triangulation(points_2d, projection_matrices):
+    all_cam_params = load_cam_params(Path("../HaMuCo/data/OR"), orbbec=True, both=False)
+    
+    base_path = "./data/output/openpose/json"
+    keypoints = load_all_keypoints(Path(base_path))
+    
+    num_files = len(keypoints[list(keypoints.keys())[0]])
 
-    num_files = 4426
     for idx in range(num_files):
-        base_path = "./data/output/json"
-        keypoints = load_all_keypoints(Path(base_path))
-
         projection_matrices = load_projection_matrix(all_cam_params)
         left_hand_keypoints = []
         right_hand_keypoints = []
-        for cam_idx in keypoints.keys():
-            keypoints_2d = extract_hand_keypoints(keypoints[cam_idx], including_confidence=False)
+        for cam_idx in all_cam_params.keys():
+            keypoints_2d = extract_hand_keypoints(keypoints[cam_idx][idx], including_confidence=False)
             left_hand_keypoints.append(np.array(keypoints_2d['left_hand']))
             right_hand_keypoints.append(np.array(keypoints_2d['right_hand']))
+
+
+        left_triangulated_points = cv2.triangulatePoints(projection_matrices['camera01'], projection_matrices['camera02'], left_hand_keypoints[0].T, left_hand_keypoints[1].T).T
+        right_triangulated_points = cv2.triangulatePoints(projection_matrices['camera01'], projection_matrices['camera02'], right_hand_keypoints[0].T, right_hand_keypoints[1].T).T
+
+        print(left_triangulated_points[:, :3].shape)
+        for left_triangulated_point, right_triangulated_point, l_kp_2d, r_kp_2d, l_kp_2d_2, r_kp_2d_2 in zip(left_triangulated_points, right_triangulated_points, left_hand_keypoints[0], right_hand_keypoints[0], left_hand_keypoints[1], right_hand_keypoints[1]):
+            left_2d_keypoints = np.array([l_kp_2d, l_kp_2d_2])
+            right_2d_keypoints = np.array([r_kp_2d, r_kp_2d_2])
+
+            l_mean_error, l_errors = validate_triangulation(left_triangulated_point, left_2d_keypoints, projection_matrices)
+            r_mean_error, r_errors = validate_triangulation(right_triangulated_point, right_2d_keypoints, projection_matrices)
+            print(l_mean_error)
+            print(r_mean_error)
+
+
+        save_base_path = "./data/output/xyz"
+        save_file(np.array(left_triangulated_points[:, :3]).tolist(), f"{save_base_path}/left/{str(idx).zfill(6)}.json")
+        save_file(np.array(right_triangulated_points[:, :3]).tolist(), f"{save_base_path}/right/{str(idx).zfill(6)}.json")
+
+
+if __name__ == "__main__":
+    all_cam_params = load_cam_params(Path("../HaMuCo/data/OR"), orbbec=True, both=False)
+
+    base_path = "./data/output/openpose/json"
+    keypoints = load_all_keypoints(Path(base_path))
+    
+    num_files = len(keypoints[list(keypoints.keys())[0]])
+    print(num_files)
+
+    for idx in range(num_files):
+        # 22, 23, 44, 51, 52, 66, 74
+        print(f"Processing file {idx}/{num_files}...")
+        projection_matrices = load_projection_matrix(all_cam_params)
+        left_hand_keypoints = []
+        right_hand_keypoints = []
+        for cam_idx in all_cam_params.keys():
+            keypoints_2d = extract_hand_keypoints(keypoints[cam_idx][idx], including_confidence=False)
+            left_hand_keypoints.append(np.array(keypoints_2d['left_hand']))
+            right_hand_keypoints.append(np.array(keypoints_2d['right_hand']))
+
 
         left_triangulated_points = []
         right_triangulated_points = []
@@ -262,26 +306,44 @@ if __name__ == "__main__":
             l_kp_2d = [left_hand_keypoints[cam_idx][i] for cam_idx in range(len(projection_matrices))]
             r_kp_2d = [right_hand_keypoints[cam_idx][i] for cam_idx in range(len(projection_matrices))]
 
-            left_triangulated_point = triangulate_point(l_kp_2d, projection_matrices)
-            right_triangulated_point = triangulate_point(r_kp_2d, projection_matrices)
 
+            left_triangulated_point, _ = ransac_triangulation(
+                l_kp_2d,
+                projection_matrices, 
+                all_cam_params,
+                max_iterations=150000, 
+                threshold=10.0
+            )
+            
+            right_triangulated_point, _ = ransac_triangulation(
+                r_kp_2d, 
+                projection_matrices,
+                all_cam_params,
+                max_iterations=150000,
+                threshold=10.0
+            )
+
+            # cv2.triangulatePoints(projection_matrices['camera01'], projection_matrices['camera02'], l_kp_2d, r_kp_2d, )
+
+            # left_triangulated_point = cv2.RANSAC.compute(l_kp_2d, projection_matrices['camera01'], projection_matrices['camera02'])
             print(left_triangulated_point)
             print(right_triangulated_point)
             left_triangulated_points.append(left_triangulated_point)
             right_triangulated_points.append(right_triangulated_point)
 
+            # print(left_triangulated_point.shape)
+            # print(right_triangulated_point.shape)
             l_mean_error, l_errors = validate_triangulation(left_triangulated_point, l_kp_2d, projection_matrices)
             r_mean_error, r_errors = validate_triangulation(right_triangulated_point, r_kp_2d, projection_matrices)
 
-            print(l_mean_error)
-            print(r_mean_error)
+            # print(l_mean_error)
+            # print(r_mean_error)
 
 
         save_base_path = "./data/output/xyz"
         save_file(np.array(left_triangulated_points).tolist(), f"{save_base_path}/left/{str(idx).zfill(6)}.json")
         save_file(np.array(right_triangulated_points).tolist(), f"{save_base_path}/right/{str(idx).zfill(6)}.json")
         
-        break
         # view_1 = json_load(f"{base_path}/camera01_{str(idx).zfill(6)}_keypoints.json")
         # view_2 = json_load(f"{base_path}/camera02_{str(idx).zfill(6)}_keypoints.json")
         # view_3 = json_load(f"{base_path}/camera03_{str(idx).zfill(6)}_keypoints.json")
@@ -303,5 +365,4 @@ if __name__ == "__main__":
         # except Exception as e:
         #     print(f"File {idx} is not existent...")
         #     print(repr(e))
-        
-        break
+    

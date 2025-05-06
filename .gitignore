@@ -1,4 +1,6 @@
-.DS_Store
+**/.DS_Store
 data/
 pytorch-openpose/*
 openpose_impl/model/*
+
+data_exp/
