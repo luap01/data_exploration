@@ -145,11 +145,14 @@ def load_cam_infos(take_path: Path, orbbec: bool = True, both: bool = False) -> 
     """
     camera_parameters = {}
     cam_lst = sorted((take_path / "calib").glob('camera*.json'))
-    
+
     if both:
         camera_paths = cam_lst
     else:
-        camera_paths = cam_lst[:4] if orbbec else cam_lst[4:]
+        if len(cam_lst) == 6:
+            camera_paths = cam_lst[:4] if orbbec else cam_lst[4:]
+        else:
+            camera_paths = cam_lst
     
     
     if both or orbbec:

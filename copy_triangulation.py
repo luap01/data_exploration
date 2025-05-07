@@ -173,7 +173,8 @@ def ransac_triangulation(points_2d, projection_matrices, camera_params, max_iter
     
     Args:
         points_2d: List of 2D points [x, y] from multiple cameras.
-        projection_matrices: List of 3x4 projection matrices.
+        projection_matrices: Dictionary of projection matrices for each camera.
+        camera_params: Dictionary of camera parameters.
         max_iterations: Number of RANSAC iterations.
         threshold: Reprojection error threshold in pixels.
     
@@ -183,38 +184,74 @@ def ransac_triangulation(points_2d, projection_matrices, camera_params, max_iter
     """
     best_inliers = []
     best_3d_point = None
-    best_responding_cam_idx = []
+    best_error = float('inf')
     
     for _ in range(max_iterations):
         # Randomly select two views
+        if len(points_2d) < 2:
+            continue
+            
         indices = random.sample(range(len(points_2d)), 2)
         sampled_points = [points_2d[i] for i in indices]
-        sampled_cameras = [projection_matrices[f'camera0{i+1}'] for i in indices]
         
-        # Triangulate 3D point
-        point_3d = triangulate_point(sampled_points, sampled_cameras)
+        # Get corresponding projection matrices
+        sampled_cameras = []
+        for idx in indices:
+            cam_key = f'camera0{idx+1}'
+            if cam_key in projection_matrices:
+                sampled_cameras.append(projection_matrices[cam_key])
         
-        # Count inliers
-        inliers = []
-        responding_cam_idx = []
-        for i in range(len(points_2d)):
-            projected_2d = project_to_2d(point_3d, camera_params[f'camera0{i+1}']['intrinsics'], np.linalg.inv(camera_params[f'camera0{i+1}']['extrinsics']) if i < 4 else camera_params[f'camera0{i+1}']['extrinsics'])
-            error = distance(projected_2d, points_2d[i])
-            if error < threshold:
-                inliers.append(i)
-                responding_cam_idx.append(f'camera0{i+1}')
-        
-        # Update best model
-        if len(inliers) > len(best_inliers):
-            best_inliers = inliers
-            best_3d_point = point_3d
-            best_responding_cam_idx = responding_cam_idx
+        if len(sampled_cameras) != 2:
+            continue
+            
+        try:
+            # Triangulate 3D point from sampled views
+            point_3d = triangulate_point(sampled_points, sampled_cameras)
+            
+            if point_3d is None:
+                continue
+                
+            # Count inliers and compute total error
+            inliers = []
+            total_error = 0
+            
+            for i, point_2d in enumerate(points_2d):
+                cam_key = f'camera0{i+1}'
+                if cam_key not in projection_matrices:
+                    continue
+                    
+                # Project 3D point back to 2D
+                projected_2d = project_to_2d(
+                    point_3d,
+                    camera_params[cam_key]['intrinsics'],
+                    np.linalg.inv(camera_params[cam_key]['extrinsics']) if i < 4 else camera_params[cam_key]['extrinsics']
+                )
+                
+                error = distance(projected_2d, point_2d)
+                total_error += error
+                
+                if error < threshold:
+                    inliers.append(i)
+            
+            # Update best model if we found more inliers or same inliers with less error
+            if len(inliers) > len(best_inliers) or (len(inliers) == len(best_inliers) and total_error < best_error):
+                best_inliers = inliers
+                best_3d_point = point_3d
+                best_error = total_error
+                
+        except Exception:
+            continue
 
-    # Refine using all inliers
-    if best_inliers:
-        refined_point = triangulate_point([points_2d[i] for i in best_inliers], [projection_matrices[cam_idx] for cam_idx in best_responding_cam_idx])
-        if refined_point is not None:
-            best_3d_point = refined_point
+    # Refine using all inliers if we found any
+    if best_inliers and len(best_inliers) >= 2:
+        try:
+            inlier_points = [points_2d[i] for i in best_inliers]
+            inlier_cameras = [projection_matrices[f'camera0{i+1}'] for i in best_inliers]
+            refined_point = triangulate_point(inlier_points, inlier_cameras)
+            if refined_point is not None:
+                best_3d_point = refined_point
+        except Exception:
+            pass
     
     return best_3d_point, best_inliers
 
@@ -335,11 +372,9 @@ if __name__ == "__main__":
 
             # print(left_triangulated_point.shape)
             # print(right_triangulated_point.shape)
-            try:
-                l_mean_error, l_errors = validate_triangulation(left_triangulated_point, l_kp_2d, projection_matrices)
-                r_mean_error, r_errors = validate_triangulation(right_triangulated_point, r_kp_2d, projection_matrices)
-            except:
-                print(f"No triangulation at {idx}: {i}")
+            l_mean_error, l_errors = validate_triangulation(left_triangulated_point, l_kp_2d, projection_matrices)
+            r_mean_error, r_errors = validate_triangulation(right_triangulated_point, r_kp_2d, projection_matrices)
+
             # print(l_mean_error)
             # print(r_mean_error)
 
@@ -347,7 +382,7 @@ if __name__ == "__main__":
         save_base_path = "./data/output/xyz"
         save_file(np.array(left_triangulated_points).tolist(), f"{save_base_path}/left/{str(idx).zfill(6)}.json")
         save_file(np.array(right_triangulated_points).tolist(), f"{save_base_path}/right/{str(idx).zfill(6)}.json")
-        
+        break
         # view_1 = json_load(f"{base_path}/camera01_{str(idx).zfill(6)}_keypoints.json")
         # view_2 = json_load(f"{base_path}/camera02_{str(idx).zfill(6)}_keypoints.json")
         # view_3 = json_load(f"{base_path}/camera03_{str(idx).zfill(6)}_keypoints.json")
