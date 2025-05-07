@@ -4,3 +4,5 @@ pytorch-openpose/*
 openpose_impl/model/*
 
 data_exp/
+
+*.jpg

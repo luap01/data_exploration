@@ -6,6 +6,8 @@ import json
 import os
 import argparse
 from pathlib import Path
+import time
+import math
 
 from openpose_impl import model
 from openpose_impl import util
@@ -19,6 +21,8 @@ from utils.image import undistort_image
 def parse_args():
     parser = argparse.ArgumentParser(description='OpenPose detection')
     parser.add_argument('--save_images', default=False, action='store_true', help='Save rendered images with keypoints')
+    parser.add_argument('--conf', type=float, default=0.5, help='Detection confidence threshold')
+    parser.add_argument('--cam_idx', type=int, default=5, help='Camera index')
     return parser.parse_args()
 
 
@@ -91,12 +95,7 @@ def enhance_image_with_blending(image, roi_points, brightness_factor=1.3):
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
-def enhance_brightness(image, factor=1.3):
-    """Simple brightness enhancement for the entire image"""
-    return cv2.convertScaleAbs(image, alpha=factor, beta=25)
-
-
-def enhance_image(image):
+def enhance_image(image, alpha=1.5, beta=15):
     """Enhanced image preprocessing with multiple techniques"""
     # Convert to LAB color space
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
@@ -113,8 +112,6 @@ def enhance_image(image):
     enhanced_bgr = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
     
     # Increase contrast
-    alpha = 1.3  # Contrast control
-    beta = 10    # Brightness control
     enhanced_contrast = cv2.convertScaleAbs(enhanced_bgr, alpha=alpha, beta=beta)
     
     return enhanced_contrast
@@ -148,161 +145,230 @@ def transform_points(points, angle, image_shape):
     return transformed_points
 
 
-def try_detect_hands(image, body_estimation, check_idx=0):
-    """Try to detect hands with different image orientations"""
-    best_result = {
-        'hands_list': [],
-        'candidate': None,
-        'subset': None,
-        'img_rotated': image,
-        'angle': 0,
-        'score': 0,
-        'debug_info': {}  # Store debug information
-    }
+def try_detect_hands(body_estimation, hand_estimation, image, save_enhanced=False, folder_name="enhanced", index=0):
+    """Try to detect hands with different image enhancements and orientations"""
+    # First try with original image
+    candidate, subset = body_estimation(image)
+    hands_list = util.handDetect(candidate, subset, image)
     
-    angles = [0, 90, 180, 270]
-    for angle in angles:
-        if angle == 0:
-            img_rotated = image
-        else:
-            # For 90 degree rotations, use cv2's built-in functions
-            if angle == 90:
-                img_rotated = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-            elif angle == 180:
-                img_rotated = cv2.rotate(image, cv2.ROTATE_180)
-            elif angle == 270:
-                img_rotated = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        
-        # Try detection
-        candidate, subset = body_estimation(img_rotated)
-        hands_list = util.handDetect(candidate, subset, img_rotated)
-        
-        # Calculate detection score
-        score = len(hands_list)
-        if score > 0:
-            if subset is not None and len(subset) > 0:
-                score += np.mean(subset[subset > 0])
-        
-        # Store debug info
-        best_result['debug_info'][angle] = {
-            'hands_found': len(hands_list),
-            'score': score
-        }
-        
-        # Update best result if this is better
-        if score > best_result['score']:
-            best_result = {
-                'hands_list': hands_list,
-                'candidate': candidate,
-                'subset': subset,
-                'img_rotated': img_rotated,
-                'angle': angle,
-                'score': score,
-                'debug_info': best_result['debug_info']
-            }
-        
-        # If we found both hands, we can stop
-        if len(hands_list) >= 2:
-            break
+    if len(hands_list) == 2:
+        return hands_list, candidate, subset, image, "original"
     
-    return (best_result['hands_list'], best_result['candidate'], 
-            best_result['subset'], best_result['img_rotated'], 
-            best_result['angle'])
+    # Try with enhanced image
+    alpha = 0.5
+    found = False
+    while alpha < 3.1 and not found:
+        beta = 0
+        while beta < 30 and not found:
+            enhanced_img = enhance_image(image, alpha=alpha, beta=beta)
+            if save_enhanced:
+                cv2.imwrite(f'{folder_name}/enhanced_{alpha}_{beta}_{index}.jpg', enhanced_img)
+            
+            # Try different rotations
+            angles = [0, 90, 180, 270]
+            for angle in angles:
+                if angle == 0:
+                    img_rotated = enhanced_img
+                else:
+                    if angle == 90:
+                        img_rotated = cv2.rotate(enhanced_img, cv2.ROTATE_90_CLOCKWISE)
+                    elif angle == 180:
+                        img_rotated = cv2.rotate(enhanced_img, cv2.ROTATE_180)
+                    elif angle == 270:
+                        img_rotated = cv2.rotate(enhanced_img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                
+                candidate_enhanced, subset_enhanced = body_estimation(img_rotated)
+                hands_list_enhanced = util.handDetect(candidate_enhanced, subset_enhanced, img_rotated)
+                
+                if len(hands_list_enhanced) == 2:
+                    # Transform points back if needed
+                    if angle != 0:
+                        height, width = image.shape[:2]
+                        for hand in hands_list_enhanced:
+                            if angle == 90:
+                                hand[0], hand[1] = hand[1], width - hand[0]
+                            elif angle == 180:
+                                hand[0], hand[1] = width - hand[0], height - hand[1]
+                            elif angle == 270:
+                                hand[0], hand[1] = height - hand[1], hand[0]
+                    
+                    return hands_list_enhanced, candidate_enhanced, subset_enhanced, enhanced_img, "enhanced"
+            
+            beta += 10
+        alpha += 0.5
+    
+    # If we found one hand, try blending
+    if len(hands_list) == 1:
+        x, y, w, is_left = hands_list[0]
+        roi_points = np.array([
+            [x - 20, y - 20],
+            [x - 20, y + w + 20],
+            [x + w + 20, y + w + 20],
+            [x + w + 20, y - 20]
+        ], dtype=np.int32)
+        
+        blended_img = enhance_image_with_blending(image, roi_points)
+        if save_enhanced:
+            cv2.imwrite(f'{folder_name}/blended_{index}.jpg', blended_img)
+        
+        candidate_blended, subset_blended = body_estimation(blended_img)
+        hands_list_blended = util.handDetect(candidate_blended, subset_blended, blended_img)
+        
+        if len(hands_list_blended) == 2:
+            return hands_list_blended, candidate_blended, subset_blended, blended_img, "blended"
+    
+    # Return best result (prefer more hands detected)
+    return hands_list, candidate, subset, image, "original"
 
 
 def main():
+    args = parse_args()
+    conf = args.conf
+    cam_idx = args.cam_idx
+    ORBBEC = True if cam_idx < 5 else False
+    
+    # Initialize paths
+    input_base_path = f"./data/input/tony/Marshall/camera0{cam_idx}/images/"
+    output_base_path = input_base_path.replace('input', 'output').replace('tony', 'tony/openpose/').replace('images', f'{conf:.2f}/images')
+    keypoints_base_path = input_base_path.replace('images', 'keypoints').replace('input', 'output').replace('tony', 'tony/openpose').replace('keypoints', f'{conf:.2f}/keypoints')
+    
+    # Create output directories
+    for dir_path in [output_base_path + '/success', output_base_path + '/partial', output_base_path + '/failure']:
+        os.makedirs(dir_path, exist_ok=True)
+    
+    for dir_path in [keypoints_base_path + '/success', keypoints_base_path + '/partial', keypoints_base_path + '/failure']:
+        os.makedirs(dir_path, exist_ok=True)
+    
+    os.makedirs(output_base_path + '/enhanced', exist_ok=True)
+    
+    # Initialize models
     BASE_PTH_MODELS = './openpose_impl/model/'
     body_estimation = Body(BASE_PTH_MODELS + 'body_pose_model.pth')
     hand_estimation = Hand(BASE_PTH_MODELS + 'hand_pose_model.pth')
-
+    
+    # Load camera parameters
     CALIB_DIR = './data/input/tony/'
-    cam_infos = load_cam_infos(Path(CALIB_DIR), orbbec=False)
-
-    cam_idx = 5
-    ORBBEC = True if cam_idx < 5 else False
-
-    BASE_DIR = f'./data/input/tony/Marshall/camera0{cam_idx}/images/'
-
-    os.makedirs(BASE_DIR.replace("input", "output"), exist_ok=True)
-    os.makedirs(BASE_DIR.replace("input", "output").replace("images", "json"), exist_ok=True)
-
-    args = parse_args()
-
-    files = os.listdir(BASE_DIR)
+    cam_infos = load_cam_infos(Path(CALIB_DIR), orbbec=ORBBEC)
+    cam_params = cam_infos[f'camera0{cam_idx}']
+    
+    files = os.listdir(input_base_path)
+    stats = {
+        "success": 0,  # both hands
+        "partial": 0,  # one hand
+        "failure": 0,  # no hands
+        "enhanced_success": 0,
+        "blended_success": 0,
+        "start_time": time.time()
+    }
+    
     for idx, file in enumerate(files):
-        cam_params = cam_infos[f'camera0{cam_idx}']
-        file_path = BASE_DIR + file
-        oriImg = cv2.imread(file_path)  # B,G,R order
+        print(f"Processing {idx+1}/{len(files)}: {file}")
+        image_path = os.path.join(input_base_path, file)
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"Failed to load image: {image_path}")
+            continue
         
+        # Undistort image
         if ORBBEC:
-            oriImg = undistort_image(oriImg, cam_params, "color")
+            image = undistort_image(image, cam_params, "color")
         else:
-            oriImg = cv2.undistort(oriImg, cam_params['intrinsics'], np.array([cam_params['radial_params'][0]] + [cam_params['radial_params'][1]] + list(cam_params['tangential_params'][:2]) + [cam_params['radial_params'][2]] + [0, 0, 0]))
-
-        # First try with original image
-        hands_list, candidate, subset, processed_img, angle = try_detect_hands(oriImg, body_estimation)
+            image = cv2.undistort(
+                image, 
+                cam_params['intrinsics'], 
+                np.array([cam_params['radial_params'][0]] + [cam_params['radial_params'][1]] + list(cam_params['tangential_params'][:2]) + [cam_params['radial_params'][2]] + [0, 0, 0])
+            )
         
-        # If no hands detected or only one hand, try with enhanced image
-        if len(hands_list) < 2:
-            print(f"Less than two hands detected in original image {idx}/{len(files)}, trying with enhancement...")
-            enhanced_img = enhance_image(oriImg)
-            if args.save_images:
-                cv2.imwrite(file_path.replace('input', 'output').replace('.jpg', '_enhanced.jpg'), enhanced_img)
+        # Try detection with enhancements if needed
+        hands_list, candidate, subset, processed_image, method_used = try_detect_hands(
+            body_estimation, hand_estimation, image, 
+            save_enhanced=True, folder_name=output_base_path + '/enhanced', 
+            index=idx
+        )
+        
+        # Initialize data structure for keypoints
+        data = {
+            "people": [{
+                "hand_left_keypoints_2d": [],
+                "hand_right_keypoints_2d": []
+            }]
+        }
+        
+        # Process detected hands
+        if hands_list:
+            num_hands = len(hands_list)
+            image_for_drawing = processed_image.copy()
             
-            new_hands_list, new_candidate, new_subset, new_processed_img, new_angle = try_detect_hands(enhanced_img, body_estimation)
-            
-            # Use enhanced results if they're better
-            if len(new_hands_list) > len(hands_list):
-                hands_list, candidate, subset, processed_img, angle = new_hands_list, new_candidate, new_subset, new_processed_img, new_angle
-
-        if len(hands_list) > 0:
-            print(f"Detected {len(hands_list)} hands for {idx}/{len(files)} at angle {angle}")
-            
-            # Process detected hands
-            all_hand_peaks = []
-            data = {}
-            data['people'] = []
-            data['people'].append({})
-            
-            for i, (x, y, w, is_left) in enumerate(hands_list):
-                # Extract hand region and process
-                hand_roi = processed_img[y:y+w, x:x+w, :]
+            # Process each detected hand
+            for hand_idx, (x, y, w, is_left) in enumerate(hands_list):
+                # Extract and process hand region
+                hand_roi = processed_image[y:y+w, x:x+w, :]
                 peaks = hand_estimation(hand_roi)
                 
-                # First adjust peaks to the rotated image space
+                # Adjust peaks to image space
                 peaks[:, 0] = np.where(peaks[:, 0]==0, peaks[:, 0], peaks[:, 0]+x)
                 peaks[:, 1] = np.where(peaks[:, 1]==0, peaks[:, 1], peaks[:, 1]+y)
                 
-                # Transform back to original orientation if needed
-                if angle != 0:
-                    peaks = transform_points(peaks, angle, oriImg.shape)
-                    # Debug print for coordinate transformation
-                    print(f"Transforming points from {angle} degrees rotation:")
-                    print(f"Image shape: {oriImg.shape}")
-                    print(f"Original hand position: ({x}, {y})")
-                    print(f"Transformed peaks shape: {peaks.shape}")
-                    print(f"Sample transformed points: {peaks[:5]}")
-                
-                all_hand_peaks.append(peaks)
-                
+                # Convert peaks to keypoints
                 hand_keypoints = []
                 for i, keypoint in enumerate(peaks):
-                    x, y = keypoint
-                    hand_keypoints.append(int(round(x)))
-                    hand_keypoints.append(int(round(y)))
-                    hand_keypoints.append(1)
-                data['people'][0]['hand_left_keypoints_2d' if is_left else 'hand_right_keypoints_2d'] = hand_keypoints
-
-            with open(file_path.replace('input', 'output').replace('.jpg', '.json').replace('images', 'json'), "w") as json_file:
-                json.dump(data, json_file, indent=4)
-
+                    x_coord, y_coord = keypoint
+                    hand_keypoints.extend([float(x_coord), float(y_coord), 1.0])
+                
+                # Store keypoints based on handedness
+                if is_left:
+                    data["people"][0]["hand_left_keypoints_2d"] = hand_keypoints
+                else:
+                    data["people"][0]["hand_right_keypoints_2d"] = hand_keypoints
+                
+                # Draw keypoints if requested
+                if args.save_images:
+                    image_for_drawing = util.draw_handpose(image_for_drawing, [peaks])
+            
+            # Determine success level and save
+            if num_hands == 2:
+                stats["success"] += 1
+                if method_used != "original":
+                    stats[f"{method_used}_success"] += 1
+                category = "success"
+            else:  # num_hands == 1
+                stats["partial"] += 1
+                category = "partial"
+            
+            # Save the annotated image and keypoints
             if args.save_images:
-                # Always use original image for visualization
-                canvas = copy.deepcopy(oriImg)
-                canvas = util.draw_handpose(canvas, all_hand_peaks)
-                cv2.imwrite(file_path.replace('input', 'output').replace('.jpg', '.png'), canvas)
+                output_image_path = os.path.join(output_base_path, category, file)
+                cv2.imwrite(output_image_path, image_for_drawing)
+            
+            keypoints_file = os.path.join(keypoints_base_path, category, file.replace('.jpg', '.json'))
+            with open(keypoints_file, 'w') as f:
+                json.dump(data, f, indent=4)
         else:
-            print(f"No hands detected for {idx}/{len(files)} even after enhancement")
+            stats["failure"] += 1
+            # Save failed detection
+            if args.save_images:
+                output_image_path = os.path.join(output_base_path, 'failure', file)
+                cv2.imwrite(output_image_path, processed_image)
+            
+            keypoints_file = os.path.join(keypoints_base_path, 'failure', file.replace('.jpg', '.json'))
+            with open(keypoints_file, 'w') as f:
+                json.dump(data, f, indent=4)
+    
+    # Calculate and print statistics
+    stats["end_time"] = time.time()
+    stats["total_time"] = stats["end_time"] - stats["start_time"]
+    stats["total_images"] = len(files)
+    stats["success_rate"] = stats["success"] / stats["total_images"] if stats["total_images"] > 0 else 0
+    stats["partial_rate"] = stats["partial"] / stats["total_images"] if stats["total_images"] > 0 else 0
+    
+    print(f"\nProcessing complete!")
+    print(f"Time taken: {stats['total_time']:.2f} seconds for {stats['total_images']} images")
+    print(f"Success (both hands): {stats['success']} images ({stats['success_rate']*100:.1f}%)")
+    print(f"Partial (one hand): {stats['partial']} images ({stats['partial_rate']*100:.1f}%)")
+    print(f"Enhanced image successes: {stats['enhanced_success']}")
+    print(f"Blended image successes: {stats['blended_success']}")
+    print(f"Failed (no hands): {stats['failure']} images")
+
 
 if __name__ == "__main__":
     main()
