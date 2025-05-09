@@ -11,14 +11,16 @@ import argparse
 from utils.camera import load_cam_infos
 from utils.image import undistort_image
 
+DEFAULT_CONF = 0.10
+
 def parse_args():
     parser = argparse.ArgumentParser(description='OpenPose detection')
     parser.add_argument('--save_images', default=False, action='store_true', help='Save rendered images with keypoints')
-    parser.add_argument('--conf', type=float, default=0.5, help='Detection confidence threshold')
+    parser.add_argument('--conf', type=float, default=DEFAULT_CONF, help='Detection confidence threshold')
     parser.add_argument('--cam_idx', type=int, default=5, help='Camera index')
     return parser.parse_args()
 
-def enhance_image_with_blending(image, roi_points, brightness_factor_outside=1.0, brightness_factor_inside=0.5):
+def enhance_image_with_blending(image, roi_points, alpha_bright=1.2, beta_bright=10, alpha_dark=0.8, beta_dark=-10):
     """
     Enhance image brightness outside ROI and reduce it inside ROI using Laplacian pyramid.
     brightness_factor_outside > 1 increases brightness outside ROI
@@ -29,15 +31,18 @@ def enhance_image_with_blending(image, roi_points, brightness_factor_outside=1.0
     roi_points = np.array(roi_points, dtype=np.int32)
     cv2.fillPoly(mask, [roi_points], 255)
     
+    # Apply Gaussian blur to mask for smoother transitions
+    mask = cv2.GaussianBlur(mask, (21, 21), 11)
+    
     # Create two enhanced versions of the image
-    enhanced_bright = cv2.convertScaleAbs(image, alpha=brightness_factor_outside, beta=0)
-    enhanced_dark = cv2.convertScaleAbs(image, alpha=1.0, beta=0)
+    enhanced_bright = np.clip(image.astype(np.float32) * alpha_bright + beta_bright, 0, 255).astype(np.uint8)
+    enhanced_dark = np.clip(image.astype(np.float32) * alpha_dark + beta_dark, 0, 255).astype(np.uint8)
     
     # Initialize output image
     result = np.zeros_like(image)
     
-    # Number of pyramid levels
-    levels = 4
+    # Number of pyramid levels - increased for smoother blending
+    levels = 6
     
     # Generate Gaussian pyramid for mask
     mask_pyramid = [mask.astype(float) / 255]
@@ -149,8 +154,8 @@ def try_angles(hands, image):
         
         results_enhanced = hands.process(img_rotated)
         if results_enhanced.multi_hand_landmarks:
-            return results_enhanced, angle
-    return None, 0
+            return results_enhanced, angle, img_rotated
+    return None, 0, image
 
 
 def rotate_point(x, y, angle_degrees, clockwise=True):
@@ -163,29 +168,22 @@ def rotate_point(x, y, angle_degrees, clockwise=True):
 
 def simple_rotate_point(x, y, angle_degrees):
     if angle_degrees == 90:
-        return y, -x
+        return -y, x
     elif angle_degrees == 180:
         return -x, -y
     elif angle_degrees == 270:
-        return -y, x
+        return y, -x
     return x, y
 
-def get_rotated_roi_points(hand_landmarks, image_shape, angle):
+
+def get_roi_points(hand_landmarks, image_shape):
     """Get ROI points in original image coordinate system"""
     h, w = image_shape[:2]
-    # If rotated 90 or 270 degrees, swap width and height
-    if angle in [90, 270]:
-        w, h = h, w
     
     points = []
     for landmark in hand_landmarks.landmark:
-        x = landmark.x
-        y = landmark.y
-
-        x, y = simple_rotate_point(x, y, angle)
-
-        x = x * w
-        y = y * h
+        x = landmark.x * w
+        y = landmark.y * h
 
         points.append((int(x), int(y)))
     
@@ -207,48 +205,116 @@ def detect_hands(hands, image, save_enhanced=False, folder_name="enhanced", inde
         return results, image, "original", 0
     
     # First enhancement: Basic image enhancement
-    alpha = 0
+    alpha = 1
     found = False
     detected_angle = 0
-    while alpha < 3.1 and not found:
+    detected_alpha = 0
+    # alpha used to be <4.1 and beta <51
+    while alpha < 4.1 and not found:
+        detected_alpha = alpha
         beta = 0
-        while beta < 31 and not found:
-            enhanced_img = enhance_image(image, alpha=alpha, beta=beta)
+        while beta < 51 and not found:
+            # enhanced_img = enhance_image(image, alpha=alpha, beta=beta)
+            enhanced_img = np.clip(image.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
             enhanced_rgb = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2RGB)
-            results_enhanced, angle = try_angles(hands, enhanced_rgb)
+            results_enhanced, angle, rotated_image = try_angles(hands, enhanced_rgb)
             if results_enhanced and results_enhanced.multi_hand_landmarks:
                 found = True
                 detected_angle = angle
+                image = rotated_image
+                print(f"Alpha: {alpha}, Beta: {beta}, Angle: {detected_angle}, Hand: {results_enhanced.multi_handedness[0].classification[0].label}")
                 break
             beta += 10
         alpha += 0.3
     
+
     if results_enhanced and results_enhanced.multi_hand_landmarks and len(results_enhanced.multi_hand_landmarks) == 2:
         if save_enhanced:
             cv2.imwrite(f'{folder_name}/enhanced_success_{index}.jpg', enhanced_img)
         return results_enhanced, enhanced_img, "enhanced", detected_angle
     
     # Second enhancement: Try with ROI blending if we detected at least one hand
-    if results and results.multi_hand_landmarks and len(results.multi_hand_landmarks) == 1:
+    if results_enhanced and results_enhanced.multi_hand_landmarks and len(results_enhanced.multi_hand_landmarks) == 1:
         # Get ROI from the detected hand in original coordinate system
-        hand_landmarks = results.multi_hand_landmarks[0]
-        roi_points = get_rotated_roi_points(hand_landmarks, image.shape, detected_angle)  # No rotation for original detection
+        hand_landmarks = results_enhanced.multi_hand_landmarks[0]
+        roi_points = get_roi_points(hand_landmarks, image.shape)  # No rotation for original detection
 
-        detected_angle = 0
-        blended_img = enhance_image_with_blending(image, roi_points, brightness_factor_outside=1.5 if alpha < 1 else 0.5, brightness_factor_inside=1.5 if alpha < 1 else 0.5)
-        blended_rgb = cv2.cvtColor(blended_img, cv2.COLOR_BGR2RGB)
-        results_blended = hands.process(blended_rgb)
+        alpha_bright = 1.0
+        alpha_dark = 1.0
+        while alpha_bright < 2.0 and alpha_dark > 0.0:
+            beta_bright = 10
+            beta_dark = -10
+            while beta_bright < 101 and beta_dark > -101:
+                blended_img = enhance_image_with_blending(image, roi_points, alpha_bright=alpha_bright, beta_bright=beta_bright, alpha_dark=alpha_dark, beta_dark=beta_dark)
+                blended_rgb = cv2.cvtColor(blended_img, cv2.COLOR_BGR2RGB)
+                cv2.imwrite(f"test_blended/{alpha_bright}_{beta_bright}_{alpha_dark}_{beta_dark}.jpg", blended_rgb)
+                results_blended = hands.process(blended_rgb)
+                if results_blended.multi_hand_landmarks and len(results_blended.multi_hand_landmarks) == 1:
+                    print(f"Blending: Alpha: {alpha}, Beta: {beta}, Angle: {detected_angle}, Hand: {results_blended.multi_handedness[0].classification[0].label}")
+                if results_blended.multi_hand_landmarks and len(results_blended.multi_hand_landmarks) == 2:
+                    if save_enhanced:
+                        cv2.imwrite(f'{folder_name}/blended_success_{index}.jpg', blended_img)
+                    return results_blended, blended_img, "blended", detected_angle
+
+
+                beta_dark -= 10
+                beta_bright += 10
+            alpha_dark -= 0.3
+            alpha_bright += 0.3
+
         
-        if results_blended.multi_hand_landmarks and len(results_blended.multi_hand_landmarks) == 2:
-            if save_enhanced:
-                cv2.imwrite(f'{folder_name}/blended_success_{index}.jpg', blended_img)
-            return results_blended, blended_img, "blended", detected_angle
+        alpha = 1.0
+        while alpha > 0.0:
+            beta = 0
+            while beta > -51:
+                enhanced_img = np.clip(image.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+                enhanced_rgb = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2RGB)
+                results_darker = hands.process(enhanced_rgb)
+                if results_darker.multi_hand_landmarks and len(results_darker.multi_hand_landmarks) == 1:
+                    print(f"Darker: Alpha: {alpha}, Beta: {beta}, Angle: {detected_angle}, Hand: {results_darker.multi_handedness[0].classification[0].label}")
+                if results_darker.multi_hand_landmarks and len(results_darker.multi_hand_landmarks) == 2:
+                    if save_enhanced:
+                        cv2.imwrite(f'{folder_name}/blended_success_{index}.jpg', blended_img)
+                    return results_blended, blended_img, "blended", detected_angle
+                beta -= 5
+            alpha -= 0.3
     
     # Return best result (prefer more hands detected)
-    if results_enhanced and results_enhanced.multi_hand_landmarks and len(results_enhanced.multi_hand_landmarks) > len(results.multi_hand_landmarks or []):
+    if results_blended and results_blended.multi_hand_landmarks and len(results_blended.multi_hand_landmarks) > len(results_enhanced.multi_hand_landmarks or []):
+        return results_blended, blended_img, "blended", detect_anlge
+    elif results_enhanced and results_enhanced.multi_hand_landmarks and len(results_enhanced.multi_hand_landmarks) > len(results.multi_hand_landmarks or []):
         return results_enhanced, enhanced_img, "enhanced", detected_angle
     return results, image, "original", detected_angle
 
+
+def transform_landmarks(landmarks, angle, image_shape):
+    """Transform landmarks to new angle considering image dimensions"""
+    h, w = image_shape[:2]
+    
+    # If rotated 90 or 270 degrees, swap width and height for the rotated image
+    if angle in [90, 270]:
+        w, h = h, w
+    
+    for landmark in landmarks.landmark:
+        # Convert from normalized to pixel coordinates in rotated image
+        x = landmark.x * w
+        y = landmark.y * h
+        
+        # Rotate point
+        if angle == 90:
+            x_new, y_new = y, w - x
+        elif angle == 180:
+            x_new, y_new = w - x, h - y
+        elif angle == 270:
+            x_new, y_new = h - y, x
+        else:  # angle == 0
+            x_new, y_new = x, y
+        
+        # Convert back to normalized coordinates in original image
+        landmark.x = x_new / image_shape[1]  # original width
+        landmark.y = y_new / image_shape[0]  # original height
+    
+    return landmarks
 
 def main():
     args = parse_args()
@@ -272,9 +338,10 @@ def main():
 
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(
-        static_image_mode=True,
+        static_image_mode=False,
         max_num_hands=2,
-        min_detection_confidence=conf
+        min_detection_confidence=conf,
+        min_tracking_confidence=0.5
     )
 
     CALIB_DIR = './data/input/tony/'
@@ -283,7 +350,7 @@ def main():
 
     mp_drawing = mp.solutions.drawing_utils
     mp_drawing_styles = mp.solutions.drawing_styles
-    files = os.listdir(input_base_path)
+    files = sorted(os.listdir(input_base_path))
     stats = {
         "success": 0,  # both hands
         "partial": 0,  # one hand
@@ -294,7 +361,13 @@ def main():
     }
 
     for idx, file in enumerate(files):
-        if idx > 10:
+        # if file != "color_000507_camera01.jpg":
+        #     continue
+        if idx < 506:
+            continue
+        
+        print(file)
+        if idx > 510:
             break
         image_path = os.path.join(input_base_path, file)
         image = cv2.imread(image_path)
@@ -325,21 +398,25 @@ def main():
         # Process detected hands
         if results.multi_hand_landmarks:
             num_hands = len(results.multi_hand_landmarks)
-            image_for_drawing = processed_image.copy()
-            
+            image_for_drawing = image.copy()
+
             # Process each detected hand
             for hand_idx, (hand_landmarks, handedness) in enumerate(zip(results.multi_hand_landmarks, results.multi_handedness)):
+                
+                retransformed_hand_landmarks = transform_landmarks(hand_landmarks, detected_angle, image.shape)
                 # Draw landmarks on the image
                 mp_drawing.draw_landmarks(
                     image_for_drawing,
-                    hand_landmarks,
+                    retransformed_hand_landmarks,
                     mp_hands.HAND_CONNECTIONS,
                     mp_drawing_styles.get_default_hand_landmarks_style(),
                     mp_drawing_styles.get_default_hand_connections_style()
                 )
                 
                 # Process landmarks into keypoints
-                keypoints = process_hand_landmarks(hand_landmarks, handedness, image.shape, detected_angle)
+                keypoints = []
+                for landmark in retransformed_hand_landmarks.landmark:
+                    keypoints.extend([float(landmark.x * image.shape[1]), float(landmark.y * image.shape[0]), 1.0])
                 
                 # Store keypoints based on handedness
                 hand_type = handedness.classification[0].label.lower()

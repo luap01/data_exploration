@@ -68,7 +68,7 @@ def main():
     for y in np.linspace(-2, 2, 5):
         ax.plot([-2, 2], [y, y], [0, 0], 'b-', alpha=0.2)
     
-    # Plot points and connections
+    # Plot points and xconnections
     ax.scatter(left_points[:, 0], left_points[:, 1], left_points[:, 2], 
               c='blue', marker='o', label='Left Hand', s=50)
     plot_hand_connections(ax, left_points, 'blue')
