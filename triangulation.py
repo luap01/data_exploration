@@ -292,6 +292,8 @@ if __name__ == "__main__":
 
     for idx in range(num_files):
         # 22, 23, 44, 51, 52, 66, 74
+        if idx > 16:
+            break
         print(f"Processing file {idx}/{num_files}...")
         projection_matrices = load_projection_matrix(all_cam_params)
         left_hand_keypoints = []
@@ -313,16 +315,16 @@ if __name__ == "__main__":
                 l_kp_2d,
                 projection_matrices, 
                 all_cam_params,
-                max_iterations=150000, 
-                threshold=10.0
+                max_iterations=10000, 
+                threshold=100.0
             )
             
             right_triangulated_point, _ = ransac_triangulation(
                 r_kp_2d, 
                 projection_matrices,
                 all_cam_params,
-                max_iterations=150000,
-                threshold=10.0
+                max_iterations=10000,
+                threshold=100.0
             )
 
             # cv2.triangulatePoints(projection_matrices['camera01'], projection_matrices['camera02'], l_kp_2d, r_kp_2d, )

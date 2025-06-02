@@ -176,6 +176,9 @@ def simple_rotate_point(x, y, angle_degrees):
     return x, y
 
 
+def compute_bbox():
+    pass
+
 def get_roi_points(hand_landmarks, image_shape):
     """Get ROI points in original image coordinate system"""
     h, w = image_shape[:2]
@@ -359,13 +362,15 @@ def main():
         "blended_success": 0,
         "start_time": time.time()
     }
-
+    files = ['cropped_150.jpg']
     for idx, file in enumerate(files):
         # if file != "color_000507_camera01.jpg":
         #     continue
-        if idx < 506:
-            continue
+        # if idx < 506:
+        #    continue
         
+        if file != "cropped_150.jpg":
+            continue
         print(file)
         if idx > 510:
             break
