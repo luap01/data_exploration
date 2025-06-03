@@ -380,14 +380,14 @@ def main():
             print(f"Failed to load image: {image_path}")
             continue
 
-        if ORBBEC:
-            image = undistort_image(image, cam_params, "color")
-        else:
-            image = cv2.undistort(
-                image, 
-                cam_params['intrinsics'], 
-                np.array([cam_params['radial_params'][0]] + [cam_params['radial_params'][1]] + list(cam_params['tangential_params'][:2]) + [cam_params['radial_params'][2]] + [0, 0, 0])
-            )
+        # if ORBBEC:
+        #     image = undistort_image(image, cam_params, "color")
+        # else:
+        #     image = cv2.undistort(
+        #         image, 
+        #         cam_params['intrinsics'], 
+        #         np.array([cam_params['radial_params'][0]] + [cam_params['radial_params'][1]] + list(cam_params['tangential_params'][:2]) + [cam_params['radial_params'][2]] + [0, 0, 0])
+        #     )
 
         # Try detection with enhancements if needed
         results, processed_image, method_used, detected_angle = detect_hands(hands, image, save_enhanced=save, folder_name=f"{output_base_path}/enhanced", index=idx)

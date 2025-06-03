@@ -3,9 +3,7 @@ from pathlib import Path
 import numpy as np
 import mediapipe as mp
 
-
 from utils.camera import load_cam_infos
-
 
 
 def get_roi_points(hand_landmarks, image_shape):
@@ -60,6 +58,50 @@ def crop_to_bbox(image, bbox):
     return image[y_min:y_max, x_min:x_max]
 
 
+def crop_fixed_size(image, hand_landmarks, size=256):
+    """
+    Crop a square region of specified size around the middle finger MCP joint (knuckle).
+    Handles boundary conditions and ensures the crop is within image bounds.
+    """
+    h, w = image.shape[:2]
+    
+    # Get middle finger MCP joint (knuckle) coordinates - landmark index 9
+    # root joint (wrist) is landmark[0]
+    root_x = int(hand_landmarks.landmark[0].x * w)  # landmark[9] is middle finger MCP
+    root_y = int(hand_landmarks.landmark[0].y * h)
+    
+    # Calculate crop boundaries
+    half_size = size // 2
+    x_min = max(0, root_x - half_size)
+    y_min = max(0, root_y - half_size)
+    x_max = min(w, root_x + half_size)
+    y_max = min(h, root_y + half_size)
+    
+    # If crop would go out of bounds, adjust the crop region while maintaining size
+    if x_min == 0:
+        x_max = min(w, size)
+    if y_min == 0:
+        y_max = min(h, size)
+    if x_max == w:
+        x_min = max(0, w - size)
+    if y_max == h:
+        y_min = max(0, h - size)
+    
+    # Crop the image
+    cropped = image[y_min:y_max, x_min:x_max]
+    
+    # If the cropped image is smaller than desired size (happens at image boundaries)
+    # pad it with zeros to maintain the desired size
+    if cropped.shape[0] != size or cropped.shape[1] != size:
+        padded = np.zeros((size, size, 3), dtype=np.uint8)
+        y_offset = (size - cropped.shape[0]) // 2
+        x_offset = (size - cropped.shape[1]) // 2
+        padded[y_offset:y_offset+cropped.shape[0], x_offset:x_offset+cropped.shape[1]] = cropped
+        return padded
+    
+    return cropped
+
+
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
@@ -93,35 +135,100 @@ enhanced_rgb = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2RGB)
 results = hands.process(enhanced_rgb)
 
 if results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
-
     hand_side = results.multi_handedness[0].classification[0].label
     print(hand_side)
+    print(len(results.multi_hand_landmarks))
+
+    img_to_process = img.copy()
+    for hand_idx, (hand_landmarks, handedness) in enumerate(zip(results.multi_hand_landmarks, results.multi_handedness)):
+        mp_drawing.draw_landmarks(
+            img,
+            hand_landmarks,
+            mp_hands.HAND_CONNECTIONS,
+            mp_drawing_styles.get_default_hand_landmarks_style(),
+            mp_drawing_styles.get_default_hand_connections_style()
+        )
+    
+    # Crop 256x256 region around root joint
+    cropped_img = crop_fixed_size(img, results.multi_hand_landmarks[0], size=256)
+    cv2.imwrite(f"test_bbox/cropped_256_{hand_side.lower()}.jpg", cropped_img)
+    
+    # If you still want the original bbox visualization
     shift = 150
     roi = get_roi_points(results.multi_hand_landmarks[0], img.shape)
     bbox = compute_bbox(roi.copy(), hand_side, shift)
     
-    # # Draw bbox points and lines on the full image
-    # for x, y in bbox:
-    #     print(x,y)
-    #     cv2.circle(img, (int(x), int(y)), 4, (0, 255, 255), -1)
 
-    # cv2.line(img, bbox[0], bbox[1], (255, 0, 255), 1)
-    # cv2.line(img, bbox[1], bbox[2], (255, 0, 255), 1)
-    # cv2.line(img, bbox[2], bbox[3], (255, 0, 255), 1)
-    # cv2.line(img, bbox[3], bbox[0], (255, 0, 255), 1)
+    # Draw bbox points and lines on the full image
+    for x, y in bbox:
+        print(x,y)
+        cv2.circle(img, (int(x), int(y)), 4, (0, 255, 255), -1)
+
+    cv2.line(img, bbox[0], bbox[1], (255, 0, 255), 1)
+    cv2.line(img, bbox[1], bbox[2], (255, 0, 255), 1)
+    cv2.line(img, bbox[2], bbox[3], (255, 0, 255), 1)
+    cv2.line(img, bbox[3], bbox[0], (255, 0, 255), 1)
     
-    # # Draw ROI points and lines on the full image
-    # for x,y in roi:
-    #     cv2.circle(img, (int(x), int(y)), 4, (0, 255, 0), -1)
+    # Draw ROI points and lines on the full image
+    for x,y in roi:
+        cv2.circle(img, (int(x), int(y)), 4, (0, 255, 0), -1)
 
-    # cv2.line(img, roi[0], roi[1], (255, 0, 255), 1)
-    # cv2.line(img, roi[1], roi[2], (255, 0, 255), 1)
-    # cv2.line(img, roi[2], roi[3], (255, 0, 255), 1)
-    # cv2.line(img, roi[3], roi[0], (255, 0, 255), 1)
+    cv2.line(img, roi[0], roi[1], (255, 0, 255), 1)
+    cv2.line(img, roi[1], roi[2], (255, 0, 255), 1)
+    cv2.line(img, roi[2], roi[3], (255, 0, 255), 1)
+    cv2.line(img, roi[3], roi[0], (255, 0, 255), 1)
 
     # Save the full image with bbox visualization
     cv2.imwrite(f"test_bbox/test_{shift}.jpg", img)
+
+    cropped_img = crop_to_bbox(img_to_process, bbox)
+    cv2.imshow("img", cropped_img)
+    cv2.waitKey(0)
+    alpha = 1
+    found = False
+    while alpha < 4.1 and not found:
+        beta = 0
+        while beta < 51 and not found:
+            enhanced_img = np.clip(cropped_img.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+            enhanced_rgb = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2RGB)
+            results = hands.process(enhanced_rgb)
+            if results and results.multi_hand_landmarks:
+                print(alpha, beta)
+                found = True
+            beta += 10
+        alpha += 0.3
+
     
-    # Crop and save just the bbox region
-    cropped_img = crop_to_bbox(img, bbox)
-    cv2.imwrite(f"test_bbox/cropped_{shift}.jpg", cropped_img)
+    print(len(results.multi_hand_landmarks))
+    hand_side = results.multi_handedness[0].classification[0].label
+    print(hand_side)
+    roi = get_roi_points(results.multi_hand_landmarks[0], cropped_img.shape)
+    bbox = compute_bbox(roi.copy(), hand_side, shift)
+    
+    for x, y in bbox:
+        cv2.circle(cropped_img, (int(x), int(y)), 4, (0, 255, 255), -1)
+
+    cv2.line(cropped_img, bbox[0], bbox[1], (255, 0, 255), 1)
+    cv2.line(cropped_img, bbox[1], bbox[2], (255, 0, 255), 1)
+    cv2.line(cropped_img, bbox[2], bbox[3], (255, 0, 255), 1)
+    cv2.line(cropped_img, bbox[3], bbox[0], (255, 0, 255), 1)
+
+
+    for hand_idx, (hand_landmarks, handedness) in enumerate(zip(results.multi_hand_landmarks, results.multi_handedness)):
+        mp_drawing.draw_landmarks(
+            cropped_img,
+            hand_landmarks,
+            mp_hands.HAND_CONNECTIONS,
+            mp_drawing_styles.get_default_hand_landmarks_style(),
+            mp_drawing_styles.get_default_hand_connections_style()
+        )
+        
+    # Crop 256x256 region around root joint
+    cropped_img = crop_fixed_size(cropped_img, results.multi_hand_landmarks[0], size=256)
+    cv2.imwrite(f"test_bbox/cropped_256_{hand_side.lower()}.jpg", cropped_img)
+
+    cv2.imshow("img", cropped_img)
+    cv2.waitKey(0)
+    
+
+
