@@ -2,6 +2,7 @@ import cv2
 from pathlib import Path
 import numpy as np
 import mediapipe as mp
+import json
 
 from utils.camera import load_cam_infos
 
@@ -99,7 +100,21 @@ def crop_fixed_size(image, hand_landmarks, size=256):
         padded[y_offset:y_offset+cropped.shape[0], x_offset:x_offset+cropped.shape[1]] = cropped
         return padded
     
-    return cropped
+    return cropped, (x_min, y_min)
+
+def get_keypoints(data, image, hand_landmarks, hand_type, bbox_origin):
+    # Process landmarks into keypoints
+    keypoints = []
+    x_min, y_min = bbox_origin
+    for landmark in hand_landmarks.landmark:
+        keypoints.extend([float(landmark.x * image.shape[1]) - x_min, float(landmark.y * image.shape[0]) - y_min, 1.0])
+
+    if hand_type == "left":
+        data["people"][0]["hand_left_keypoints_2d"] = keypoints
+    else:  # right
+        data["people"][0]["hand_right_keypoints_2d"] = keypoints
+    
+    return data
 
 
 mp_hands = mp.solutions.hands
@@ -134,12 +149,25 @@ enhanced_rgb = cv2.cvtColor(enhanced_img, cv2.COLOR_BGR2RGB)
 
 results = hands.process(enhanced_rgb)
 
+# Initialize data structure for keypoints
+data = {
+    "people": [{
+        "hand_left_keypoints_2d": [],
+        "hand_right_keypoints_2d": []
+    }]
+}
+
 if results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
-    hand_side = results.multi_handedness[0].classification[0].label
+    hand_side = results.multi_handedness[0].classification[0].label.lower()
     print(hand_side)
     print(len(results.multi_hand_landmarks))
 
     img_to_process = img.copy()
+    # Crop 256x256 region around root joint
+    blank_img, crop_origin = crop_fixed_size(img, results.multi_hand_landmarks[0], size=256)
+    cv2.imwrite(f"test_bbox/cropped_256_{hand_side.lower()}_blank.jpg", blank_img)
+    data = get_keypoints(data, img, results.multi_hand_landmarks[0], hand_side, crop_origin)
+
     for hand_idx, (hand_landmarks, handedness) in enumerate(zip(results.multi_hand_landmarks, results.multi_handedness)):
         mp_drawing.draw_landmarks(
             img,
@@ -148,16 +176,16 @@ if results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
             mp_drawing_styles.get_default_hand_landmarks_style(),
             mp_drawing_styles.get_default_hand_connections_style()
         )
-    
+
+
     # Crop 256x256 region around root joint
-    cropped_img = crop_fixed_size(img, results.multi_hand_landmarks[0], size=256)
+    cropped_img, _ = crop_fixed_size(img, results.multi_hand_landmarks[0], size=256)
     cv2.imwrite(f"test_bbox/cropped_256_{hand_side.lower()}.jpg", cropped_img)
     
     # If you still want the original bbox visualization
     shift = 150
     roi = get_roi_points(results.multi_hand_landmarks[0], img.shape)
     bbox = compute_bbox(roi.copy(), hand_side, shift)
-    
 
     # Draw bbox points and lines on the full image
     for x, y in bbox:
@@ -200,10 +228,15 @@ if results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
 
     
     print(len(results.multi_hand_landmarks))
-    hand_side = results.multi_handedness[0].classification[0].label
+    hand_side = results.multi_handedness[0].classification[0].label.lower()
     print(hand_side)
     roi = get_roi_points(results.multi_hand_landmarks[0], cropped_img.shape)
     bbox = compute_bbox(roi.copy(), hand_side, shift)
+    
+
+    blank_img, crop_origin = crop_fixed_size(cropped_img, results.multi_hand_landmarks[0], size=256)
+    cv2.imwrite(f"test_bbox/cropped_256_{hand_side}_blank.jpg", blank_img)
+    data = get_keypoints(data, cropped_img, results.multi_hand_landmarks[0], hand_side, crop_origin)
     
     for x, y in bbox:
         cv2.circle(cropped_img, (int(x), int(y)), 4, (0, 255, 255), -1)
@@ -224,11 +257,15 @@ if results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
         )
         
     # Crop 256x256 region around root joint
-    cropped_img = crop_fixed_size(cropped_img, results.multi_hand_landmarks[0], size=256)
+    cropped_img, _ = crop_fixed_size(cropped_img, results.multi_hand_landmarks[0], size=256)
     cv2.imwrite(f"test_bbox/cropped_256_{hand_side.lower()}.jpg", cropped_img)
+
 
     cv2.imshow("img", cropped_img)
     cv2.waitKey(0)
     
+    with open('test_bbox/test.json', 'w') as f:
+        json.dump(data, f, indent=4)
+
 
 
