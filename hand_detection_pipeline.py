@@ -12,16 +12,22 @@ from threading import Lock
 import threading
 
 from utils.camera import load_cam_infos
+from utils.image import undistort_image
 
 
 @dataclass
 class PipelineConfig:
     """Configuration for the hand detection pipeline"""
     input_path: str = "data/input/tony/Marshall/camera05/images"
-    output_path: str = "test_bbox"
-    camera_name: str = "camera05"
-    image_prefix: str = "color_"
-    image_suffix: str = "_camera01.jpg"
+    # camera_path: str = "./data/input/tony/"
+    camera_path: str = "data/input/"
+    output_path: str = "preprocessed_OR_data"
+    camera_name: str = "camera01"
+    orbbec_cam: bool = True
+    # image_prefix: str = "color_"
+    # image_suffix: str = "_camera01.jpg"
+    image_prefix: str = ""
+    image_suffix: str = ".jpg"
     
     # Processing parameters
     crop_size: int = 256
@@ -65,12 +71,12 @@ class HandDetectionPipeline:
         )
         self.logger = logging.getLogger(__name__)
     
-    def create_mediapipe_instance(self):
+    def create_mediapipe_instance(self, max_hands: Optional[int] = None):
         """Create a new MediaPipe instance for thread safety"""
         mp_hands = mp.solutions.hands
         hands = mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=self.config.max_num_hands,
+            max_num_hands=max_hands if max_hands is not None else self.config.max_num_hands,
             min_detection_confidence=self.config.min_detection_confidence,
             min_tracking_confidence=self.config.min_tracking_confidence
         )
@@ -94,7 +100,7 @@ class HandDetectionPipeline:
     def load_camera_params(self):
         """Load camera calibration parameters"""
         try:
-            cam_infos = load_cam_infos(Path("./data/input/tony/"), orbbec=False)
+            cam_infos = load_cam_infos(Path(self.config.camera_path), orbbec=self.config.orbbec_cam)
             self.cam_params = cam_infos[self.config.camera_name]
         except Exception as e:
             self.logger.error(f"Failed to load camera parameters: {e}")
@@ -107,16 +113,18 @@ class HandDetectionPipeline:
             self.logger.warning(f"Failed to load image: {img_path}")
             return None
         
-        # Apply undistortion
-        distortion_coeffs = np.array([
-            self.cam_params['radial_params'][0],
-            self.cam_params['radial_params'][1],
-            *self.cam_params['tangential_params'][:2],
-            self.cam_params['radial_params'][2],
-            0, 0, 0
-        ])
-        
-        undistorted = cv2.undistort(img, self.cam_params['intrinsics'], distortion_coeffs)
+        if self.config.orbbec_cam:
+            undistorted = undistort_image(img, self.cam_params, 'color')
+        else:
+            # Apply undistortion
+            distortion_coeffs = np.array([
+                self.cam_params['radial_params'][0],
+                self.cam_params['radial_params'][1],
+                *self.cam_params['tangential_params'][:2],
+                self.cam_params['radial_params'][2],
+                0, 0, 0
+            ])
+            undistorted = cv2.undistort(img, self.cam_params['intrinsics'], distortion_coeffs)
         return undistorted
     
     def try_rotation_angles(self, image: np.ndarray, hands) -> Tuple[Optional[any], int, np.ndarray]:
@@ -416,6 +424,9 @@ class HandDetectionPipeline:
         current_hand_side = hand_side
         original_bbox = None  # Store original bbox for failure visualization
         
+        # Create a new MediaPipe instance with max_hands=1 for retry logic
+        single_hand_detector, mp_drawing, mp_drawing_styles, mp_hands = self.create_mediapipe_instance(max_hands=1)
+        
         while first_try or retry:
             try:
                 bbox = self.compute_shifted_bbox(roi.copy(), current_hand_side)
@@ -427,8 +438,8 @@ class HandDetectionPipeline:
                 # Crop to shifted bbox
                 cropped_img, bbox_origin = self.crop_to_bbox(image.copy(), bbox)
                 
-                # Detect hands in cropped region with enhancement
-                cropped_results, angle = self.detect_hands_with_enhancement(cropped_img, hands)
+                # Use single_hand_detector for cropped region detection
+                cropped_results, angle = self.detect_hands_with_enhancement(cropped_img, single_hand_detector)
                 
                 if angle != 0:
                     self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
@@ -731,13 +742,18 @@ class HandDetectionPipeline:
 def main():
     """Main execution function"""
     # Configure pipeline
+
+    camera = "camera04"
     config = PipelineConfig(
-        input_path="data/input/tony/Marshall/camera05/images",
-        output_path="test_bbox_rotation_test_multithread",
+        # input_path="data/input/tony/Marshall/camera05/images",
+        input_path=f"data/input/orbbec/{camera}",
+        output_path=f"test_diff_setup_2/{camera}",
+        camera_name=camera,
+        orbbec_cam=True,
         crop_size=256,
-        bbox_shift=250,
-        max_workers=4,  # Number of threads
-        batch_size=75   # Images per batch
+        bbox_shift=150,
+        max_workers=10,     # Number of threads
+        batch_size=20       # Images per batch
     )
     
     # Create pipeline
@@ -746,7 +762,7 @@ def main():
     start = time.time()
     
     # Use multithreaded version for better performance
-    pipeline.run_multithreaded(start_idx=100, end_idx=500)
+    pipeline.run_multithreaded(start_idx=0, end_idx=200)
     
     # Alternative: use single-threaded version
     # pipeline.run(start_idx=100, end_idx=1000)

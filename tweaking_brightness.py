@@ -1,3 +1,14 @@
+
+
+import os
+os.environ["TF_LOGGING_VERBOSITY"] = "ERROR"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import warnings
+warnings.filterwarnings("ignore", message="All log messages before absl::InitializeLog")
+import absl.logging
+absl.logging.set_verbosity(absl.logging.ERROR)
+absl.logging.set_stderrthreshold(absl.logging.ERROR)
+
 import cv2
 from pathlib import Path
 import numpy as np
