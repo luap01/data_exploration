@@ -47,12 +47,8 @@ def load_all_keypoints(take_path: Path):
     for dir in dirs:
         files = os.listdir(take_path / dir)
         files.sort()
-        i = 0
+        keypoints[dir] = []
         for file in files:
             kpt_path = take_path / dir / file
-            key = dir + "/" + file
-            keypoints[key] = json_load(kpt_path)
-            i += 1
-            if i > 10:
-                break
+            keypoints[dir].append(json_load(kpt_path))
     return keypoints

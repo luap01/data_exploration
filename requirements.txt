@@ -1,0 +1,7 @@
+opencv-python
+rootutils
+numpy
+torch
+torchvision
+torchaudio
+mediapipe
