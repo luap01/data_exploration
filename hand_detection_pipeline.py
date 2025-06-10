@@ -10,9 +10,38 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import threading
+from enum import Enum
 
 from utils.camera import load_cam_infos
 from utils.image import undistort_image
+
+
+class ShiftDirection(Enum):
+    LEFT_RIGHT = "left_right"  # Original behavior (cameras 1, 5, 6)
+    UP_DOWN = "up_down"        # For cameras 2
+    DOWN_UP = "down_up"        # For camera 3
+    DIAGONAL = "diagonal"      # For camera 4
+
+
+@dataclass
+class CameraShiftConfig:
+    """Configuration for camera-specific bbox shifts"""
+    direction: ShiftDirection
+    primary_shift: int  # Main shift amount
+    secondary_shift: int = 0  # Secondary shift amount for diagonal movements
+
+    @staticmethod
+    def get_camera_config(camera_name: str, base_shift: int) -> 'CameraShiftConfig':
+        """Get camera-specific shift configuration"""
+        configs = {
+            "camera01": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
+            "camera02": CameraShiftConfig(ShiftDirection.UP_DOWN, base_shift),
+            "camera03": CameraShiftConfig(ShiftDirection.DOWN_UP, base_shift),
+            "camera04": CameraShiftConfig(ShiftDirection.DIAGONAL, base_shift),
+            "camera05": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
+            "camera06": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
+        }
+        return configs.get(camera_name, CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift))
 
 
 @dataclass
@@ -238,30 +267,91 @@ class HandDetectionPipeline:
         return roi_points
     
     def compute_shifted_bbox(self, roi: np.ndarray, hand_side: str) -> np.ndarray:
-        """Compute shifted bounding box for hand detection"""
+        """Compute shifted bounding box for hand detection based on camera configuration"""
         bbox = roi.copy()
         shift = self.config.bbox_shift
         half_shift = shift // 2
         
-        # Expand ROI in all directions
-        bbox[0, 0] -= half_shift        # top-left: left
-        bbox[0, 1] -= shift             # top-left: up
-        bbox[1, 0] -= half_shift        # bottom-left: left
-        bbox[1, 1] += shift             # bottom-left: down
-        bbox[2, 0] += half_shift        # bottom-right: right 
-        bbox[2, 1] += shift             # bottom-right: down
-        bbox[3, 0] += half_shift        # top-right: right
-        bbox[3, 1] -= shift             # top-right: up
+        # Get camera-specific shift configuration
+        cam_config = CameraShiftConfig.get_camera_config(self.config.camera_name, shift)
         
-        # Shift based on hand side
-        if hand_side == "left":
-            bbox[:, 0] += shift  # Shift right for left hand
-            bbox[2, 0] += shift
-            bbox[3, 0] += shift
-        else:
-            bbox[:, 0] -= shift  # Shift left for right hand
-            bbox[0, 0] -= shift
-            bbox[1, 0] -= shift
+        
+        # Apply camera-specific shifts
+        if cam_config.direction == ShiftDirection.LEFT_RIGHT:
+            # Expand ROI in all directions with a small base expansion
+            bbox[0, 0] -= half_shift    # top-left: left
+            bbox[0, 1] -= shift         # top-left: up
+            bbox[1, 0] -= half_shift    # bottom-left: left
+            bbox[1, 1] += shift         # bottom-left: down
+            bbox[2, 0] += half_shift    # bottom-right: right 
+            bbox[2, 1] += shift         # bottom-right: down
+            bbox[3, 0] += half_shift    # top-right: right
+            bbox[3, 1] -= shift         # top-right: up
+
+            # Original left-right behavior
+            if hand_side == "left":
+                bbox[:, 0] += shift  # Shift right for left hand
+                bbox[2, 0] += shift
+                bbox[3, 0] += shift
+            else:
+                bbox[:, 0] -= shift  # Shift left for right hand
+                bbox[0, 0] -= shift
+                bbox[1, 0] -= shift
+                
+        elif cam_config.direction == ShiftDirection.UP_DOWN or cam_config.direction == ShiftDirection.DOWN_UP:
+            # Expand ROI in all directions with a small base expansion
+            bbox[0, 0] -= shift         # top-left: left
+            bbox[0, 1] -= half_shift    # top-left: up
+            bbox[1, 0] -= shift         # bottom-left: left
+            bbox[1, 1] += half_shift    # bottom-left: down
+            bbox[2, 0] += shift         # bottom-right: right 
+            bbox[2, 1] += half_shift    # bottom-right: down
+            bbox[3, 0] += shift         # top-right: right
+            bbox[3, 1] -= half_shift    # top-right: up
+
+            if cam_config.direction == ShiftDirection.UP_DOWN:
+                # Vertical shift for cameras 2
+                if hand_side == "left":
+                    bbox[:, 1] += shift  # Shift down for left hand
+                    bbox[1, 1] += shift
+                    bbox[2, 1] += shift
+                else:
+                    bbox[:, 1] -= shift  # Shift up for right hand
+                    bbox[0, 1] -= shift
+                    bbox[3, 1] -= shift
+            else:
+                # Vertical shift for cameras 3
+                if hand_side == "left":
+                    bbox[:, 1] -= shift  # Shift down for left hand
+                    bbox[1, 1] -= shift
+                    bbox[2, 1] -= shift
+                else:
+                    bbox[:, 1] += shift  # Shift up for right hand
+                    bbox[0, 1] += shift
+                    bbox[3, 1] += shift
+
+                
+        elif cam_config.direction == ShiftDirection.DIAGONAL:
+            # Expand ROI in all directions with a small base expansion
+            bbox[0, 0] -= half_shift    # top-left: left
+            bbox[0, 1] -= shift         # top-left: up
+            bbox[1, 0] -= half_shift    # bottom-left: left
+            bbox[1, 1] += shift         # bottom-left: down
+            bbox[2, 0] += half_shift    # bottom-right: right 
+            bbox[2, 1] += shift         # bottom-right: down
+            bbox[3, 0] += half_shift    # top-right: right
+            bbox[3, 1] -= shift         # top-right: up
+
+            # Diagonal shift for camera 4
+            if hand_side == "left":
+                # Shift down-left for left hand
+                bbox[:, 0] -= shift     # Shift left
+                bbox[:, 1] += shift     # Shift down
+            else:
+                # Shift up-right for right hand
+                bbox[:, 0] += shift     # Shift right
+                bbox[:, 1] -= shift     # Shift up
+        
         return bbox
     
     def crop_to_bbox(self, image: np.ndarray, bbox: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -744,12 +834,14 @@ def main():
     # Configure pipeline
 
     camera = "camera04"
+    conf = 0.7
     config = PipelineConfig(
         # input_path="data/input/tony/Marshall/camera05/images",
         input_path=f"data/input/orbbec/{camera}",
-        output_path=f"test_diff_setup_2/{camera}",
+        output_path=f"test_diff_setup_2/conf_{conf:.1f}/{camera}",
         camera_name=camera,
         orbbec_cam=True,
+        min_detection_confidence=conf,
         crop_size=256,
         bbox_shift=150,
         max_workers=10,     # Number of threads
