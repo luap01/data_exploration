@@ -7,18 +7,56 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict, Any
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import threading
+from enum import Enum
 
 from utils.camera import load_cam_infos
+from utils.image import undistort_image
+
+
+class ShiftDirection(Enum):
+    LEFT_RIGHT = "left_right"  # Original behavior (cameras 1, 5, 6)
+    UP_DOWN = "up_down"        # For cameras 2
+    DOWN_UP = "down_up"        # For camera 3
+    DIAGONAL = "diagonal"      # For camera 4
+
+
+@dataclass
+class CameraShiftConfig:
+    """Configuration for camera-specific bbox shifts"""
+    direction: ShiftDirection
+    primary_shift: int  # Main shift amount
+    secondary_shift: int = 0  # Secondary shift amount for diagonal movements
+
+    @staticmethod
+    def get_camera_config(camera_name: str, base_shift: int) -> 'CameraShiftConfig':
+        """Get camera-specific shift configuration"""
+        configs = {
+            "camera01": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
+            "camera02": CameraShiftConfig(ShiftDirection.UP_DOWN, base_shift),
+            "camera03": CameraShiftConfig(ShiftDirection.DOWN_UP, base_shift),
+            "camera04": CameraShiftConfig(ShiftDirection.DIAGONAL, base_shift),
+            "camera05": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
+            "camera06": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
+        }
+        return configs.get(camera_name, CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift))
 
 
 @dataclass
 class PipelineConfig:
     """Configuration for the hand detection pipeline"""
     input_path: str = "data/input/tony/Marshall/camera05/images"
-    output_path: str = "test_bbox"
-    camera_name: str = "camera05"
-    image_prefix: str = "color_"
-    image_suffix: str = "_camera01.jpg"
+    # camera_path: str = "./data/input/tony/"
+    camera_path: str = "data/input/"
+    output_path: str = "preprocessed_OR_data"
+    camera_name: str = "camera01"
+    orbbec_cam: bool = True
+    # image_prefix: str = "color_"
+    # image_suffix: str = "_camera01.jpg"
+    image_prefix: str = ""
+    image_suffix: str = ".jpg"
     
     # Processing parameters
     crop_size: int = 256
@@ -35,6 +73,10 @@ class PipelineConfig:
     alpha_step: float = 0.3
     max_beta: int = 51
     beta_step: int = 10
+    
+    # Threading parameters
+    max_workers: int = 4
+    batch_size: int = 100
 
 
 class HandDetectionPipeline:
@@ -43,27 +85,31 @@ class HandDetectionPipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.setup_logging()
-        self.setup_mediapipe()
         self.setup_output_dirs()
         self.load_camera_params()
+        # Thread-safe counters
+        self.processed_count = 0
+        self.failed_count = 0
+        self.lock = Lock()
     
     def setup_logging(self):
         """Setup logging configuration"""
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'
+        )
         self.logger = logging.getLogger(__name__)
     
-    def setup_mediapipe(self):
-        """Initialize MediaPipe hands detection"""
+    def create_mediapipe_instance(self, max_hands: Optional[int] = None):
+        """Create a new MediaPipe instance for thread safety"""
         mp_hands = mp.solutions.hands
-        self.hands = mp_hands.Hands(
+        hands = mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=self.config.max_num_hands,
+            max_num_hands=max_hands if max_hands is not None else self.config.max_num_hands,
             min_detection_confidence=self.config.min_detection_confidence,
             min_tracking_confidence=self.config.min_tracking_confidence
         )
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
-        self.mp_hands = mp_hands
+        return hands, mp.solutions.drawing_utils, mp.solutions.drawing_styles, mp_hands
     
     def setup_output_dirs(self):
         """Create output directories"""
@@ -83,7 +129,7 @@ class HandDetectionPipeline:
     def load_camera_params(self):
         """Load camera calibration parameters"""
         try:
-            cam_infos = load_cam_infos(Path("./data/input/tony/"), orbbec=False)
+            cam_infos = load_cam_infos(Path(self.config.camera_path), orbbec=self.config.orbbec_cam)
             self.cam_params = cam_infos[self.config.camera_name]
         except Exception as e:
             self.logger.error(f"Failed to load camera parameters: {e}")
@@ -96,19 +142,21 @@ class HandDetectionPipeline:
             self.logger.warning(f"Failed to load image: {img_path}")
             return None
         
-        # Apply undistortion
-        distortion_coeffs = np.array([
-            self.cam_params['radial_params'][0],
-            self.cam_params['radial_params'][1],
-            *self.cam_params['tangential_params'][:2],
-            self.cam_params['radial_params'][2],
-            0, 0, 0
-        ])
-        
-        undistorted = cv2.undistort(img, self.cam_params['intrinsics'], distortion_coeffs)
+        if self.config.orbbec_cam:
+            undistorted = undistort_image(img, self.cam_params, 'color')
+        else:
+            # Apply undistortion
+            distortion_coeffs = np.array([
+                self.cam_params['radial_params'][0],
+                self.cam_params['radial_params'][1],
+                *self.cam_params['tangential_params'][:2],
+                self.cam_params['radial_params'][2],
+                0, 0, 0
+            ])
+            undistorted = cv2.undistort(img, self.cam_params['intrinsics'], distortion_coeffs)
         return undistorted
     
-    def try_rotation_angles(self, image: np.ndarray) -> Tuple[Optional[any], int, np.ndarray]:
+    def try_rotation_angles(self, image: np.ndarray, hands) -> Tuple[Optional[any], int, np.ndarray]:
         """Try different image rotations for hand detection"""
         angles = [0, 90, 180, 270]
         for angle in angles:
@@ -123,7 +171,7 @@ class HandDetectionPipeline:
                 elif angle == 270:
                     img_rotated = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
             
-            results_rotated = self.hands.process(img_rotated)
+            results_rotated = hands.process(img_rotated)
             if results_rotated and results_rotated.multi_hand_landmarks:
                 return results_rotated, angle, img_rotated
         return None, 0, image
@@ -155,11 +203,11 @@ class HandDetectionPipeline:
         
         return landmarks
     
-    def detect_hands_with_enhancement(self, image: np.ndarray) -> Tuple[Optional[any], int]:
+    def detect_hands_with_enhancement(self, image: np.ndarray, hands) -> Tuple[Optional[any], int]:
         """Detect hands with brightness/contrast enhancement and rotation if needed"""
         # Try original image first
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb_image)
+        results = hands.process(rgb_image)
         
         if results and results.multi_hand_landmarks:
             return results, 0
@@ -169,13 +217,13 @@ class HandDetectionPipeline:
             for beta in range(0, self.config.max_beta, self.config.beta_step):
                 enhanced = np.clip(image.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
                 enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
-                results = self.hands.process(enhanced_rgb)
+                results = hands.process(enhanced_rgb)
                 
                 if results and results.multi_hand_landmarks:
                     return results, 0
                 
                 # If enhancement alone doesn't work, try with rotation
-                results_rotated, angle, rotated_img = self.try_rotation_angles(enhanced_rgb)
+                results_rotated, angle, rotated_img = self.try_rotation_angles(enhanced_rgb, hands)
                 if results_rotated and results_rotated.multi_hand_landmarks:
                     # Transform landmarks back to original coordinate system
                     for hand_landmarks in results_rotated.multi_hand_landmarks:
@@ -185,7 +233,7 @@ class HandDetectionPipeline:
                     return results_rotated, angle
         
         # If enhancement fails, try rotation on original image
-        results_rotated, angle, rotated_img = self.try_rotation_angles(rgb_image)
+        results_rotated, angle, rotated_img = self.try_rotation_angles(rgb_image, hands)
         if results_rotated and results_rotated.multi_hand_landmarks:
             # Transform landmarks back to original coordinate system
             for hand_landmarks in results_rotated.multi_hand_landmarks:
@@ -219,30 +267,91 @@ class HandDetectionPipeline:
         return roi_points
     
     def compute_shifted_bbox(self, roi: np.ndarray, hand_side: str) -> np.ndarray:
-        """Compute shifted bounding box for hand detection"""
+        """Compute shifted bounding box for hand detection based on camera configuration"""
         bbox = roi.copy()
         shift = self.config.bbox_shift
         half_shift = shift // 2
         
-        # Expand ROI in all directions
-        bbox[0, 0] -= half_shift        # top-left: left
-        bbox[0, 1] -= shift             # top-left: up
-        bbox[1, 0] -= half_shift        # bottom-left: left
-        bbox[1, 1] += shift             # bottom-left: down
-        bbox[2, 0] += half_shift        # bottom-right: right 
-        bbox[2, 1] += shift             # bottom-right: down
-        bbox[3, 0] += half_shift        # top-right: right
-        bbox[3, 1] -= shift             # top-right: up
+        # Get camera-specific shift configuration
+        cam_config = CameraShiftConfig.get_camera_config(self.config.camera_name, shift)
         
-        # Shift based on hand side
-        if hand_side == "left":
-            bbox[:, 0] += shift  # Shift right for left hand
-            bbox[2, 0] += shift
-            bbox[3, 0] += shift
-        else:
-            bbox[:, 0] -= shift  # Shift left for right hand
-            bbox[0, 0] -= shift
-            bbox[1, 0] -= shift
+        
+        # Apply camera-specific shifts
+        if cam_config.direction == ShiftDirection.LEFT_RIGHT:
+            # Expand ROI in all directions with a small base expansion
+            bbox[0, 0] -= half_shift    # top-left: left
+            bbox[0, 1] -= shift         # top-left: up
+            bbox[1, 0] -= half_shift    # bottom-left: left
+            bbox[1, 1] += shift         # bottom-left: down
+            bbox[2, 0] += half_shift    # bottom-right: right 
+            bbox[2, 1] += shift         # bottom-right: down
+            bbox[3, 0] += half_shift    # top-right: right
+            bbox[3, 1] -= shift         # top-right: up
+
+            # Original left-right behavior
+            if hand_side == "left":
+                bbox[:, 0] += shift  # Shift right for left hand
+                bbox[2, 0] += shift
+                bbox[3, 0] += shift
+            else:
+                bbox[:, 0] -= shift  # Shift left for right hand
+                bbox[0, 0] -= shift
+                bbox[1, 0] -= shift
+                
+        elif cam_config.direction == ShiftDirection.UP_DOWN or cam_config.direction == ShiftDirection.DOWN_UP:
+            # Expand ROI in all directions with a small base expansion
+            bbox[0, 0] -= shift         # top-left: left
+            bbox[0, 1] -= half_shift    # top-left: up
+            bbox[1, 0] -= shift         # bottom-left: left
+            bbox[1, 1] += half_shift    # bottom-left: down
+            bbox[2, 0] += shift         # bottom-right: right 
+            bbox[2, 1] += half_shift    # bottom-right: down
+            bbox[3, 0] += shift         # top-right: right
+            bbox[3, 1] -= half_shift    # top-right: up
+
+            if cam_config.direction == ShiftDirection.UP_DOWN:
+                # Vertical shift for cameras 2
+                if hand_side == "left":
+                    bbox[:, 1] += shift  # Shift down for left hand
+                    bbox[1, 1] += shift
+                    bbox[2, 1] += shift
+                else:
+                    bbox[:, 1] -= shift  # Shift up for right hand
+                    bbox[0, 1] -= shift
+                    bbox[3, 1] -= shift
+            else:
+                # Vertical shift for cameras 3
+                if hand_side == "left":
+                    bbox[:, 1] -= shift  # Shift down for left hand
+                    bbox[1, 1] -= shift
+                    bbox[2, 1] -= shift
+                else:
+                    bbox[:, 1] += shift  # Shift up for right hand
+                    bbox[0, 1] += shift
+                    bbox[3, 1] += shift
+
+                
+        elif cam_config.direction == ShiftDirection.DIAGONAL:
+            # Expand ROI in all directions with a small base expansion
+            bbox[0, 0] -= half_shift    # top-left: left
+            bbox[0, 1] -= shift         # top-left: up
+            bbox[1, 0] -= half_shift    # bottom-left: left
+            bbox[1, 1] += shift         # bottom-left: down
+            bbox[2, 0] += half_shift    # bottom-right: right 
+            bbox[2, 1] += shift         # bottom-right: down
+            bbox[3, 0] += half_shift    # top-right: right
+            bbox[3, 1] -= shift         # top-right: up
+
+            # Diagonal shift for camera 4
+            if hand_side == "left":
+                # Shift down-left for left hand
+                bbox[:, 0] -= shift     # Shift left
+                bbox[:, 1] += shift     # Shift down
+            else:
+                # Shift up-right for right hand
+                bbox[:, 0] += shift     # Shift right
+                bbox[:, 1] -= shift     # Shift up
+        
         return bbox
     
     def crop_to_bbox(self, image: np.ndarray, bbox: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -330,15 +439,16 @@ class HandDetectionPipeline:
             f"hand_{hand_type}_shift": [x_min, y_min]
         }
     
-    def draw_landmarks_and_bbox(self, image: np.ndarray, hand_landmarks, bbox: np.ndarray, roi: np.ndarray) -> np.ndarray:
+    def draw_landmarks_and_bbox(self, image: np.ndarray, hand_landmarks, bbox: np.ndarray, roi: np.ndarray, 
+                               mp_drawing, mp_drawing_styles, mp_hands) -> np.ndarray:
         """Draw hand landmarks and bounding boxes on image"""
         result_img = image.copy()
         
         # Draw hand landmarks
-        self.mp_drawing.draw_landmarks(
-            result_img, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
-            self.mp_drawing_styles.get_default_hand_landmarks_style(),
-            self.mp_drawing_styles.get_default_hand_connections_style()
+        mp_drawing.draw_landmarks(
+            result_img, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+            mp_drawing_styles.get_default_hand_landmarks_style(),
+            mp_drawing_styles.get_default_hand_connections_style()
         )
         
         # Draw bounding box
@@ -359,7 +469,8 @@ class HandDetectionPipeline:
         
         return result_img
     
-    def process_single_hand(self, image: np.ndarray, results, img_idx: str) -> Optional[Dict[str, Any]]:
+    def process_single_hand(self, image: np.ndarray, results, img_idx: str, 
+                           hands, mp_drawing, mp_drawing_styles, mp_hands) -> Optional[Dict[str, Any]]:
         """Process image with single hand detection"""
         hand_landmarks = results.multi_hand_landmarks[0]
         hand_side = results.multi_handedness[0].classification[0].label.lower()
@@ -379,10 +490,10 @@ class HandDetectionPipeline:
         
         # Create visualization with landmarks
         vis_img = image.copy()
-        self.mp_drawing.draw_landmarks(
-            vis_img, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
-            self.mp_drawing_styles.get_default_hand_landmarks_style(),
-            self.mp_drawing_styles.get_default_hand_connections_style()
+        mp_drawing.draw_landmarks(
+            vis_img, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+            mp_drawing_styles.get_default_hand_landmarks_style(),
+            mp_drawing_styles.get_default_hand_connections_style()
         )
         
         # Crop visualization
@@ -403,6 +514,9 @@ class HandDetectionPipeline:
         current_hand_side = hand_side
         original_bbox = None  # Store original bbox for failure visualization
         
+        # Create a new MediaPipe instance with max_hands=1 for retry logic
+        single_hand_detector, mp_drawing, mp_drawing_styles, mp_hands = self.create_mediapipe_instance(max_hands=1)
+        
         while first_try or retry:
             try:
                 bbox = self.compute_shifted_bbox(roi.copy(), current_hand_side)
@@ -414,8 +528,8 @@ class HandDetectionPipeline:
                 # Crop to shifted bbox
                 cropped_img, bbox_origin = self.crop_to_bbox(image.copy(), bbox)
                 
-                # Detect hands in cropped region with enhancement
-                cropped_results, angle = self.detect_hands_with_enhancement(cropped_img)
+                # Use single_hand_detector for cropped region detection
+                cropped_results, angle = self.detect_hands_with_enhancement(cropped_img, single_hand_detector)
                 
                 if angle != 0:
                     self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
@@ -461,14 +575,16 @@ class HandDetectionPipeline:
                             self.get_roi_points(detected_landmarks, cropped_img.shape), 
                             detected_hand_side
                         ), 
-                        self.get_roi_points(detected_landmarks, cropped_img.shape)
+                        self.get_roi_points(detected_landmarks, cropped_img.shape),
+                        mp_drawing, mp_drawing_styles, mp_hands
                     )
                     
                     final_vis_crop, _ = self.crop_fixed_size(vis_cropped, detected_landmarks)
                     cv2.imwrite(self.dirs['preds'] / f"{img_idx}_cropped_256_{detected_hand_side}.jpg", final_vis_crop)
                     
                     # Save shifted ROI visualization
-                    full_vis = self.draw_landmarks_and_bbox(image, hand_landmarks, bbox, roi)
+                    full_vis = self.draw_landmarks_and_bbox(image, hand_landmarks, bbox, roi,
+                                                           mp_drawing, mp_drawing_styles, mp_hands)
                     cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}.jpg", full_vis)
                     
                     break  # Success, exit the retry loop
@@ -487,7 +603,8 @@ class HandDetectionPipeline:
                         bbox_retry = self.compute_shifted_bbox(roi.copy(), current_hand_side)
                         
                         # Draw retry bbox visualization
-                        retry_vis = self.draw_landmarks_and_bbox(retry_img, hand_landmarks, bbox_retry, roi)
+                        retry_vis = self.draw_landmarks_and_bbox(retry_img, hand_landmarks, bbox_retry, roi,
+                                                               mp_drawing, mp_drawing_styles, mp_hands)
                         cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}_retry.jpg", retry_vis)
                         
                     else:
@@ -498,7 +615,8 @@ class HandDetectionPipeline:
                         
                         # Save failure images
                         cv2.imwrite(self.dirs['failed'] / f"{img_idx}_test_{self.config.bbox_shift}_retry.jpg", retry_vis)
-                        original_vis = self.draw_landmarks_and_bbox(image, hand_landmarks, original_bbox, roi)
+                        original_vis = self.draw_landmarks_and_bbox(image, hand_landmarks, original_bbox, roi,
+                                                                   mp_drawing, mp_drawing_styles, mp_hands)
                         cv2.imwrite(self.dirs['failed'] / f"{img_idx}_test_{self.config.bbox_shift}.jpg", original_vis)
                         break
                         
@@ -517,7 +635,8 @@ class HandDetectionPipeline:
         
         return data
     
-    def process_double_hands(self, image: np.ndarray, results, img_idx: str) -> Dict[str, Any]:
+    def process_double_hands(self, image: np.ndarray, results, img_idx: str,
+                            hands, mp_drawing, mp_drawing_styles, mp_hands) -> Dict[str, Any]:
         """Process image with two hands detected"""
         self.logger.info(f"Processing {img_idx}: 2 hands detected")
         
@@ -542,8 +661,11 @@ class HandDetectionPipeline:
         
         return data
     
-    def process_image(self, img_idx: str) -> bool:
-        """Process a single image"""
+    def process_image_thread_safe(self, img_idx: str) -> bool:
+        """Thread-safe version of process_image"""
+        # Create MediaPipe instances for this thread
+        hands, mp_drawing, mp_drawing_styles, mp_hands = self.create_mediapipe_instance()
+        
         # Construct image path
         img_path = f"{self.config.input_path}/{self.config.image_prefix}{img_idx}{self.config.image_suffix}"
         
@@ -553,7 +675,7 @@ class HandDetectionPipeline:
             return False
         
         # Detect hands
-        results, angle = self.detect_hands_with_enhancement(image)
+        results, angle = self.detect_hands_with_enhancement(image, hands)
         if not results or not results.multi_hand_landmarks:
             self.logger.info(f"No hands detected in {img_idx}")
             return False
@@ -563,9 +685,9 @@ class HandDetectionPipeline:
         
         # Process based on number of hands
         if len(results.multi_hand_landmarks) == 2:
-            data = self.process_double_hands(image, results, img_idx)
+            data = self.process_double_hands(image, results, img_idx, hands, mp_drawing, mp_drawing_styles, mp_hands)
         elif results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
-            data = self.process_single_hand(image, results, img_idx)
+            data = self.process_single_hand(image, results, img_idx, hands, mp_drawing, mp_drawing_styles, mp_hands)
         else:
             return False
         
@@ -579,9 +701,115 @@ class HandDetectionPipeline:
         
         return True
     
+    def process_batch(self, indices: List[int]) -> Tuple[int, int]:
+        """Process a batch of images and return (processed_count, failed_count)"""
+        batch_processed = 0
+        batch_failed = 0
+        
+        for idx in indices:
+            img_idx = f"{idx:06d}"
+            
+            try:
+                if self.process_image_thread_safe(img_idx):
+                    batch_processed += 1
+                else:
+                    batch_failed += 1
+            except Exception as e:
+                self.logger.error(f"Error processing {img_idx}: {e}")
+                batch_failed += 1
+        
+        # Thread-safe update of global counters
+        with self.lock:
+            self.processed_count += batch_processed
+            self.failed_count += batch_failed
+        
+        return batch_processed, batch_failed
+    
+    def create_batches(self, start_idx: int, end_idx: int) -> List[List[int]]:
+        """Create batches of image indices"""
+        all_indices = list(range(start_idx, end_idx))
+        batches = []
+        
+        for i in range(0, len(all_indices), self.config.batch_size):
+            batch = all_indices[i:i + self.config.batch_size]
+            batches.append(batch)
+        
+        return batches
+    
+    def run_multithreaded(self, start_idx: int, end_idx: int):
+        """Run the pipeline with multithreading"""
+        self.logger.info(f"Starting multithreaded pipeline for images {start_idx:06d} to {end_idx:06d}")
+        self.logger.info(f"Configuration: {self.config.max_workers} workers, batch size {self.config.batch_size}")
+        
+        # Create batches
+        batches = self.create_batches(start_idx, end_idx)
+        self.logger.info(f"Created {len(batches)} batches")
+        
+        # Reset counters
+        self.processed_count = 0
+        self.failed_count = 0
+        
+        # Process batches with ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+            # Submit all batches
+            future_to_batch = {executor.submit(self.process_batch, batch): i for i, batch in enumerate(batches)}
+            
+            # Process completed batches
+            for future in as_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                try:
+                    batch_processed, batch_failed = future.result()
+                    self.logger.info(f"Batch {batch_idx + 1}/{len(batches)} completed: "
+                                   f"processed={batch_processed}, failed={batch_failed}")
+                except Exception as e:
+                    self.logger.error(f"Batch {batch_idx + 1} failed with error: {e}")
+        
+        self.logger.info(f"Multithreaded pipeline completed. "
+                        f"Total processed: {self.processed_count}, Total failed: {self.failed_count}")
+
+    def process_image(self, img_idx: str) -> bool:
+        """Process a single image (legacy method for backward compatibility)"""
+        # Create MediaPipe instances
+        hands, mp_drawing, mp_drawing_styles, mp_hands = self.create_mediapipe_instance()
+        
+        # Construct image path
+        img_path = f"{self.config.input_path}/{self.config.image_prefix}{img_idx}{self.config.image_suffix}"
+        
+        # Load and undistort image
+        image = self.load_and_undistort_image(img_path)
+        if image is None:
+            return False
+        
+        # Detect hands
+        results, angle = self.detect_hands_with_enhancement(image, hands)
+        if not results or not results.multi_hand_landmarks:
+            self.logger.info(f"No hands detected in {img_idx}")
+            return False
+        
+        if angle != 0:
+            self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
+        
+        # Process based on number of hands
+        if len(results.multi_hand_landmarks) == 2:
+            data = self.process_double_hands(image, results, img_idx, hands, mp_drawing, mp_drawing_styles, mp_hands)
+        elif results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
+            data = self.process_single_hand(image, results, img_idx, hands, mp_drawing, mp_drawing_styles, mp_hands)
+        else:
+            return False
+        
+        if data is None:
+            return False
+        
+        # Save JSON data
+        json_path = self.dirs['json'] / f"{img_idx}_test.json"
+        with open(json_path, 'w') as f:
+            json.dump(data, f, indent=4)
+        
+        return True
+
     def run(self, start_idx: int, end_idx: int):
-        """Run the pipeline on a range of images"""
-        self.logger.info(f"Starting pipeline for images {start_idx:06d} to {end_idx:06d}")
+        """Run the pipeline on a range of images (single-threaded)"""
+        self.logger.info(f"Starting single-threaded pipeline for images {start_idx:06d} to {end_idx:06d}")
         
         processed_count = 0
         failed_count = 0
@@ -598,24 +826,39 @@ class HandDetectionPipeline:
                 self.logger.error(f"Error processing {img_idx}: {e}")
                 failed_count += 1
         
-        self.logger.info(f"Pipeline completed. Processed: {processed_count}, Failed: {failed_count}")
+        self.logger.info(f"Single-threaded pipeline completed. Processed: {processed_count}, Failed: {failed_count}")
 
 
 def main():
     """Main execution function"""
     # Configure pipeline
+
+    camera = "camera04"
+    conf = 0.7
     config = PipelineConfig(
-        input_path="data/input/tony/Marshall/camera05/images",
-        output_path="test_bbox_rotation_test",
+        # input_path="data/input/tony/Marshall/camera05/images",
+        input_path=f"data/input/orbbec/{camera}",
+        output_path=f"test_diff_setup_2/conf_{conf:.1f}/{camera}",
+        camera_name=camera,
+        orbbec_cam=True,
+        min_detection_confidence=conf,
         crop_size=256,
-        bbox_shift=250
+        bbox_shift=150,
+        max_workers=10,     # Number of threads
+        batch_size=20       # Images per batch
     )
     
-    # Create and run pipeline
+    # Create pipeline
     pipeline = HandDetectionPipeline(config)
 
     start = time.time()
-    pipeline.run(start_idx=100, end_idx=1000)
+    
+    # Use multithreaded version for better performance
+    pipeline.run_multithreaded(start_idx=0, end_idx=200)
+    
+    # Alternative: use single-threaded version
+    # pipeline.run(start_idx=100, end_idx=1000)
+    
     end = time.time()
     
     elapsed_time = end - start

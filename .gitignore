@@ -6,3 +6,9 @@ openpose_impl/model/*
 data_exp/
 
 *.jpg
+
+
+#testing
+test_*/
+
+test.ipynb
