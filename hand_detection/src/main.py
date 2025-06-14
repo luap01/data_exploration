@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import mediapipe as mp
 import json
 from pathlib import Path
 from dataclasses import dataclass
@@ -15,8 +14,8 @@ from enum import Enum
 from utils.camera import load_cam_infos
 from utils.image import undistort_image
 
-from .models.hand_detector import HandDetection
-from .models.mediapipe_detector import MediaPipeHandDetector
+from models.hand_detector import HandDetection
+from models.mediapipe_detector import MediaPipeHandDetector
 
 class ShiftDirection(Enum):
     LEFT_RIGHT = "left_right"  # Original behavior (cameras 1, 5, 6)
@@ -50,13 +49,10 @@ class CameraShiftConfig:
 class PipelineConfig:
     """Configuration for the hand detection pipeline"""
     input_path: str = "data/input/tony/Marshall/camera05/images"
-    # camera_path: str = "./data/input/tony/"
     camera_path: str = "data/input/"
     output_path: str = "preprocessed_OR_data"
     camera_name: str = "camera01"
     orbbec_cam: bool = True
-    # image_prefix: str = "color_"
-    # image_suffix: str = "_camera01.jpg"
     image_prefix: str = ""
     image_suffix: str = ".jpg"
     
@@ -89,6 +85,15 @@ class HandDetectionPipeline:
         self.setup_logging()
         self.setup_output_dirs()
         self.load_camera_params()
+        
+        # Initialize detector
+        self.detector = MediaPipeHandDetector(
+            max_num_hands=self.config.max_num_hands,
+            min_detection_confidence=self.config.min_detection_confidence,
+            min_tracking_confidence=self.config.min_tracking_confidence
+        )
+        self.detector.initialize()
+        
         # Thread-safe counters
         self.processed_count = 0
         self.failed_count = 0
@@ -101,17 +106,6 @@ class HandDetectionPipeline:
             format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
-    
-    def create_mediapipe_instance(self, max_hands: Optional[int] = None):
-        """Create a new MediaPipe instance for thread safety"""
-        mp_hands = mp.solutions.hands
-        hands = mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=max_hands if max_hands is not None else self.config.max_num_hands,
-            min_detection_confidence=self.config.min_detection_confidence,
-            min_tracking_confidence=self.config.min_tracking_confidence
-        )
-        return hands, mp.solutions.drawing_utils, mp.solutions.drawing_styles, mp_hands
     
     def setup_output_dirs(self):
         """Create output directories"""
@@ -173,19 +167,18 @@ class HandDetectionPipeline:
                 elif angle == 270:
                     img_rotated = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
             
-            results_rotated = self.model.detect_hands(img_rotated)
+            results_rotated = self.detector.detect_hands(img_rotated)
             if len(results_rotated) > 0:
                 return results_rotated, angle, img_rotated
-        return None, 0, image
+        return [], 0, image
     
-    def transform_landmarks_back(self, detection: HandDetection, angle: int, rotated_image_shape: Tuple[int, int], 
-                                original_image_shape: Tuple[int, int]):
+    def transform_landmarks_back(self, detection: HandDetection, angle: int, rotated_image_shape: Tuple[int, int], original_image_shape: Tuple[int, int]):
         """Transform landmarks from rotated image back to original coordinate system"""
         h_rot, w_rot = rotated_image_shape[:2]
         h_orig, w_orig = original_image_shape[:2]
         
         landmarks = detection.landmarks
-        for idx in len(landmarks.shape[0]):
+        for idx in range(0, landmarks.shape[0]):
             x, y, z = landmarks[idx]
             # Convert from normalized to pixel coordinates in rotated image
             x = x * w_rot
@@ -208,11 +201,11 @@ class HandDetectionPipeline:
             landmarks[idx] = [x, y, z]
         detection.landmarks = landmarks
     
-    def detect_hands_with_enhancement(self, image: np.ndarray, hands) -> Tuple[Optional[any], int]:
+    def detect_hands_with_enhancement(self, image: np.ndarray) -> Tuple[Optional[any], int]:
         """Detect hands with brightness/contrast enhancement and rotation if needed"""
         # Try original image first
         rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.model.detect_hands(rgb_image)
+        results = self.detector.detect_hands(rgb_image)
         
         if len(results) > 0:
             return results, 0
@@ -222,13 +215,13 @@ class HandDetectionPipeline:
             for beta in range(0, self.config.max_beta, self.config.beta_step):
                 enhanced = np.clip(image.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
                 enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
-                results = hands.process(enhanced_rgb)
+                results = self.detector.detect_hands(enhanced_rgb)
                 
                 if len(results) > 0:
                     return results, 0
                 
                 # If enhancement alone doesn't work, try with rotation
-                results_rotated, angle, rotated_img = self.try_rotation_angles(enhanced_rgb, hands)
+                results_rotated, angle, rotated_img = self.try_rotation_angles(enhanced_rgb)
                 if len(results_rotated) > 0:
                     # Transform landmarks back to original coordinate system
                     for detection in results_rotated:
@@ -238,7 +231,7 @@ class HandDetectionPipeline:
                     return results_rotated, angle
         
         # If enhancement fails, try rotation on original image
-        results_rotated, angle, rotated_img = self.try_rotation_angles(rgb_image, hands)
+        results_rotated, angle, rotated_img = self.try_rotation_angles(rgb_image)
         if len(results_rotated) > 0:
             # Transform landmarks back to original coordinate system
             for detection in results_rotated:
@@ -247,16 +240,16 @@ class HandDetectionPipeline:
                 )
             return results_rotated, angle
         
-        return None, 0
+        return [], 0
     
-    def get_roi_points(self, hand_landmarks, image_shape: Tuple[int, int]) -> np.ndarray:
+    def get_roi_points(self, detection: HandDetection, image_shape: Tuple[int, int]) -> np.ndarray:
         """Get ROI points around hand landmarks"""
         h, w = image_shape[:2]
         
         points = []
-        for landmark in hand_landmarks.landmark:
-            x = int(landmark.x * w)
-            y = int(landmark.y * h)
+        for landmark in detection.landmarks:
+            x = int(landmark[0] * w)
+            y = int(landmark[1] * h)
             points.append((x, y))
         
         x_coords, y_coords = zip(*points)
@@ -272,7 +265,7 @@ class HandDetectionPipeline:
         return roi_points
     
     def compute_shifted_bbox(self, roi: np.ndarray, hand_side: str) -> np.ndarray:
-        """Compute shifted bounding box for hand detection based on camera configuration"""
+        """Compute shifted bounding box based on camera configuration"""
         bbox = roi.copy()
         shift = self.config.bbox_shift
         half_shift = shift // 2
@@ -280,19 +273,19 @@ class HandDetectionPipeline:
         # Get camera-specific shift configuration
         cam_config = CameraShiftConfig.get_camera_config(self.config.camera_name, shift)
         
+        # Expand ROI in all directions with a small base expansion
+        bbox[0, 0] -= half_shift    # top-left: left
+        bbox[0, 1] -= shift         # top-left: up
+        bbox[1, 0] -= half_shift    # bottom-left: left
+        bbox[1, 1] += shift         # bottom-left: down
+        bbox[2, 0] += half_shift    # bottom-right: right 
+        bbox[2, 1] += shift         # bottom-right: down
+        bbox[3, 0] += half_shift    # top-right: right
+        bbox[3, 1] -= shift         # top-right: up
         
         # Apply camera-specific shifts
         if cam_config.direction == ShiftDirection.LEFT_RIGHT:
-            # Expand ROI in all directions with a small base expansion
-            bbox[0, 0] -= half_shift    # top-left: left
-            bbox[0, 1] -= shift         # top-left: up
-            bbox[1, 0] -= half_shift    # bottom-left: left
-            bbox[1, 1] += shift         # bottom-left: down
-            bbox[2, 0] += half_shift    # bottom-right: right 
-            bbox[2, 1] += shift         # bottom-right: down
-            bbox[3, 0] += half_shift    # top-right: right
-            bbox[3, 1] -= shift         # top-right: up
-
+           
             # Original left-right behavior
             if hand_side == "left":
                 bbox[:, 0] += shift  # Shift right for left hand
@@ -304,16 +297,6 @@ class HandDetectionPipeline:
                 bbox[1, 0] -= shift
                 
         elif cam_config.direction == ShiftDirection.UP_DOWN or cam_config.direction == ShiftDirection.DOWN_UP:
-            # Expand ROI in all directions with a small base expansion
-            bbox[0, 0] -= shift         # top-left: left
-            bbox[0, 1] -= half_shift    # top-left: up
-            bbox[1, 0] -= shift         # bottom-left: left
-            bbox[1, 1] += half_shift    # bottom-left: down
-            bbox[2, 0] += shift         # bottom-right: right 
-            bbox[2, 1] += half_shift    # bottom-right: down
-            bbox[3, 0] += shift         # top-right: right
-            bbox[3, 1] -= half_shift    # top-right: up
-
             if cam_config.direction == ShiftDirection.UP_DOWN:
                 # Vertical shift for cameras 2
                 if hand_side == "left":
@@ -334,18 +317,7 @@ class HandDetectionPipeline:
                     bbox[:, 1] += shift  # Shift up for right hand
                     bbox[0, 1] += shift
                     bbox[3, 1] += shift
-
-                
         elif cam_config.direction == ShiftDirection.DIAGONAL:
-            # Expand ROI in all directions with a small base expansion
-            bbox[0, 0] -= half_shift    # top-left: left
-            bbox[0, 1] -= shift         # top-left: up
-            bbox[1, 0] -= half_shift    # bottom-left: left
-            bbox[1, 1] += shift         # bottom-left: down
-            bbox[2, 0] += half_shift    # bottom-right: right 
-            bbox[2, 1] += shift         # bottom-right: down
-            bbox[3, 0] += half_shift    # top-right: right
-            bbox[3, 1] -= shift         # top-right: up
 
             # Diagonal shift for camera 4
             if hand_side == "left":
@@ -371,7 +343,7 @@ class HandDetectionPipeline:
         cropped = image[y_min:y_max, x_min:x_max]
         return cropped, (x_min, y_min)
     
-    def crop_fixed_size(self, image: np.ndarray, hand_landmarks, 
+    def crop_fixed_size(self, image: np.ndarray, detection: HandDetection, 
                        base_offset: Tuple[int, int] = (0, 0),
                        current_image_size: Optional[Tuple[int, int]] = None) -> Tuple[np.ndarray, Tuple[int, int]]:
         """Crop fixed size region around wrist joint"""
@@ -385,8 +357,8 @@ class HandDetectionPipeline:
             curr_h, curr_w = h, w
         
         # Get wrist coordinates (landmark[0])
-        root_x_detected = int(hand_landmarks.landmark[0].x * curr_w)
-        root_y_detected = int(hand_landmarks.landmark[0].y * curr_h)
+        root_x_detected = int(detection.landmarks[0][0] * curr_w)
+        root_y_detected = int(detection.landmarks[0][1] * curr_h)
         
         # Transform to original image coordinates
         root_x = root_x_detected + base_offset[0]
@@ -421,40 +393,13 @@ class HandDetectionPipeline:
             return padded, (x_min, y_min)
         
         return cropped, (x_min, y_min)
-    
-    def get_keypoints_data(self, image: np.ndarray, hand_landmarks, hand_type: str,
-                          coord_origins: List[Tuple[int, int]]) -> Dict[str, Any]:
-        """Extract keypoint data for JSON output"""
-        keypoints = []
-        
-        # Calculate total offset
-        x_min, y_min = coord_origins[-1]
-        x_orig, y_orig = 0, 0
-        if len(coord_origins) > 1:
-            x_orig, y_orig = coord_origins[-2][0], coord_origins[-2][1] 
 
-        # Extract keypoints
-        for landmark in hand_landmarks.landmark:
-            x = float(landmark.x * image.shape[1]) - x_min + x_orig
-            y = float(landmark.y * image.shape[0]) - y_min + y_orig
-            keypoints.extend([x, y, 1.0])
-        
-        return {
-            f"hand_{hand_type}_keypoints_2d": keypoints,
-            f"hand_{hand_type}_shift": [x_min, y_min]
-        }
     
-    def draw_landmarks_and_bbox(self, image: np.ndarray, hand_landmarks, bbox: np.ndarray, roi: np.ndarray, 
-                               mp_drawing, mp_drawing_styles, mp_hands) -> np.ndarray:
+    def draw_landmarks_and_bbox(self, image: np.ndarray, detection: HandDetection, bbox: np.ndarray, roi: np.ndarray) -> np.ndarray:
         """Draw hand landmarks and bounding boxes on image"""
         result_img = image.copy()
         
-        # Draw hand landmarks
-        mp_drawing.draw_landmarks(
-            result_img, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-            mp_drawing_styles.get_default_hand_landmarks_style(),
-            mp_drawing_styles.get_default_hand_connections_style()
-        )
+        self.detector.draw_landmarks(detection, result_img)
         
         # Draw bounding box
         for x, y in bbox:
@@ -474,53 +419,50 @@ class HandDetectionPipeline:
         
         return result_img
     
-    def process_single_hand(self, image: np.ndarray, results, img_idx: str, 
-                           hands, mp_drawing, mp_drawing_styles, mp_hands) -> Optional[Dict[str, Any]]:
+    def process_single_hand(self, image: np.ndarray, detection: HandDetection, img_idx: str) -> Optional[Dict[str, Any]]:
         """Process image with single hand detection"""
-        hand_landmarks = results.multi_hand_landmarks[0]
-        hand_side = results.multi_handedness[0].classification[0].label.lower()
-        
-        self.logger.info(f"Processing {img_idx}: {hand_side} hand detected")
+        self.logger.info(f"Processing {img_idx}: {detection.hand_type} hand detected")
         
         # Initialize data structure
         data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], 
                            "hand_right_shift": [], "hand_right_keypoints_2d": []}]}
         
         # Initial crop from original image
-        blank_img, crop_origin = self.crop_fixed_size(image.copy(), hand_landmarks)
-        cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{hand_side}_blank.jpg", blank_img)
+        blank_img, crop_origin = self.crop_fixed_size(image.copy(), detection)
+        cv2.imwrite(str(self.dirs['blanks'] / f"{img_idx}_cropped_256_{detection.hand_type}_blank.jpg"), blank_img)
         
-        keypoint_data = self.get_keypoints_data(image, hand_landmarks, hand_side, [crop_origin])
+        # Get keypoints data
+        keypoint_data = self.detector.get_keypoints_data(detection, image.shape[:2], [crop_origin])
         data["people"][0].update(keypoint_data)
         
         # Create visualization with landmarks
         vis_img = image.copy()
-        mp_drawing.draw_landmarks(
-            vis_img, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-            mp_drawing_styles.get_default_hand_landmarks_style(),
-            mp_drawing_styles.get_default_hand_connections_style()
-        )
+        vis_img = self.detector.draw_landmarks(detection, vis_img)
         
         # Crop visualization
-        cropped_vis, _ = self.crop_fixed_size(vis_img, hand_landmarks)
-        cv2.imwrite(self.dirs['preds'] / f"{img_idx}_cropped_256_{hand_side}.jpg", cropped_vis)
+        cropped_vis, _ = self.crop_fixed_size(vis_img, detection)
+        cv2.imwrite(self.dirs['preds'] / f"{img_idx}_cropped_256_{detection.hand_type}.jpg", cropped_vis)
         
         # Save original image
         cv2.imwrite(self.dirs['original'] / f"{img_idx}_test.jpg", image)
         
         # Try shifted bbox approach with retry mechanism
-        roi = self.get_roi_points(hand_landmarks, image.shape)
+        roi = self.get_roi_points(detection, image.shape)
         
         # Retry mechanism for hand misclassification
         first_try = True
         retry = False
         fail = False
-        prev_detected_handside = hand_side
-        current_hand_side = hand_side
+        prev_detected_handside = detection.hand_type
+        current_hand_side = prev_detected_handside
         original_bbox = None  # Store original bbox for failure visualization
         
         # Create a new MediaPipe instance with max_hands=1 for retry logic
-        single_hand_detector, mp_drawing, mp_drawing_styles, mp_hands = self.create_mediapipe_instance(max_hands=1)
+        self.detector.__init__(
+            max_num_hands=1, 
+            min_detection_confidence=self.config.min_detection_confidence, 
+            min_tracking_confidence=self.config.min_tracking_confidence
+        )
         
         while first_try or retry:
             try:
@@ -534,7 +476,7 @@ class HandDetectionPipeline:
                 cropped_img, bbox_origin = self.crop_to_bbox(image.copy(), bbox)
                 
                 # Use single_hand_detector for cropped region detection
-                cropped_results, angle = self.detect_hands_with_enhancement(cropped_img, single_hand_detector)
+                cropped_results, angle = self.detect_hands_with_enhancement(cropped_img)
                 
                 if angle != 0:
                     self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
@@ -553,19 +495,19 @@ class HandDetectionPipeline:
                 
                 if found:
                     # Process the detected hand
-                    detected_landmarks = cropped_results.multi_hand_landmarks[0]
+                    detected_detection = cropped_results[0]
                     detected_hand_side = "right" if current_hand_side == "left" else "right"
                     
                     # Create final crop from original image using detected landmarks
                     final_crop, final_origin = self.crop_fixed_size(
-                        image, detected_landmarks, 
+                        image, detected_detection, 
                         base_offset=bbox_origin, 
                         current_image_size=cropped_img.shape[:2]
                     )
                     
                     # Update keypoints data
-                    final_keypoint_data = self.get_keypoints_data(
-                        cropped_img, detected_landmarks, detected_hand_side, 
+                    final_keypoint_data = self.detector.get_keypoints_data(
+                        detected_detection, cropped_img.shape[:2], 
                         [bbox_origin, final_origin]
                     )
                     data["people"][0].update(final_keypoint_data)
@@ -575,21 +517,20 @@ class HandDetectionPipeline:
                     
                     # Create visualization of cropped region
                     vis_cropped = self.draw_landmarks_and_bbox(
-                        cropped_img, detected_landmarks, 
-                        self.compute_shifted_bbox(
-                            self.get_roi_points(detected_landmarks, cropped_img.shape), 
+                        cropped_img, 
+                        detected_detection, 
+                        bbox=self.compute_shifted_bbox(
+                            self.get_roi_points(detected_detection, cropped_img.shape), 
                             detected_hand_side
                         ), 
-                        self.get_roi_points(detected_landmarks, cropped_img.shape),
-                        mp_drawing, mp_drawing_styles, mp_hands
+                        roi=self.get_roi_points(detected_detection, cropped_img.shape)
                     )
                     
-                    final_vis_crop, _ = self.crop_fixed_size(vis_cropped, detected_landmarks)
+                    final_vis_crop, _ = self.crop_fixed_size(vis_cropped, detected_detection)
                     cv2.imwrite(self.dirs['preds'] / f"{img_idx}_cropped_256_{detected_hand_side}.jpg", final_vis_crop)
                     
                     # Save shifted ROI visualization
-                    full_vis = self.draw_landmarks_and_bbox(image, hand_landmarks, bbox, roi,
-                                                           mp_drawing, mp_drawing_styles, mp_hands)
+                    full_vis = self.draw_landmarks_and_bbox(image, detection, bbox, roi)
                     cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}.jpg", full_vis)
                     
                     break  # Success, exit the retry loop
@@ -608,8 +549,7 @@ class HandDetectionPipeline:
                         bbox_retry = self.compute_shifted_bbox(roi.copy(), current_hand_side)
                         
                         # Draw retry bbox visualization
-                        retry_vis = self.draw_landmarks_and_bbox(retry_img, hand_landmarks, bbox_retry, roi,
-                                                               mp_drawing, mp_drawing_styles, mp_hands)
+                        retry_vis = self.draw_landmarks_and_bbox(retry_img, detection, bbox_retry, roi)
                         cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}_retry.jpg", retry_vis)
                         
                     else:
@@ -620,8 +560,7 @@ class HandDetectionPipeline:
                         
                         # Save failure images
                         cv2.imwrite(self.dirs['failed'] / f"{img_idx}_test_{self.config.bbox_shift}_retry.jpg", retry_vis)
-                        original_vis = self.draw_landmarks_and_bbox(image, hand_landmarks, original_bbox, roi,
-                                                                   mp_drawing, mp_drawing_styles, mp_hands)
+                        original_vis = self.draw_landmarks_and_bbox(image, detection, original_bbox, roi)
                         cv2.imwrite(self.dirs['failed'] / f"{img_idx}_test_{self.config.bbox_shift}.jpg", original_vis)
                         break
                         
@@ -638,10 +577,15 @@ class HandDetectionPipeline:
         if fail:
             return None
         
+        self.detector.__init__(
+            max_num_hands=2, 
+            min_detection_confidence=self.config.min_detection_confidence, 
+            min_tracking_confidence=self.config.min_tracking_confidence
+        )
         return data
     
-    def process_double_hands(self, image: np.ndarray, results, img_idx: str,
-                            hands, mp_drawing, mp_drawing_styles, mp_hands) -> Dict[str, Any]:
+    def process_double_hands(self, image: np.ndarray, detections: List[HandDetection], 
+                           img_idx: str) -> Dict[str, Any]:
         """Process image with two hands detected"""
         self.logger.info(f"Processing {img_idx}: 2 hands detected")
         
@@ -653,24 +597,19 @@ class HandDetectionPipeline:
         cv2.imwrite(self.dirs['original'] / f"{img_idx}_test.jpg", image)
 
         # Process both hands
-        for i, (hand_landmarks, handedness) in enumerate(zip(results.multi_hand_landmarks, results.multi_handedness)):
-            hand_side = handedness.classification[0].label.lower()
-            
+        for detection in detections:
             # Crop around each hand
-            blank_img, crop_origin = self.crop_fixed_size(image.copy(), hand_landmarks)
-            cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{hand_side}_blank.jpg", blank_img)
+            blank_img, crop_origin = self.crop_fixed_size(image.copy(), detection)
+            cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{detection.hand_type}_blank.jpg", blank_img)
             
             # Get keypoints
-            keypoint_data = self.get_keypoints_data(image, hand_landmarks, hand_side, [crop_origin])
+            keypoint_data = self.detector.get_keypoints_data(detection, image.shape[:2], [crop_origin])
             data["people"][0].update(keypoint_data)
         
         return data
     
     def process_image_thread_safe(self, img_idx: str) -> bool:
         """Thread-safe version of process_image"""
-        # Create MediaPipe instances for this thread
-        hands, mp_drawing, mp_drawing_styles, mp_hands = self.create_mediapipe_instance()
-        
         # Construct image path
         img_path = f"{self.config.input_path}/{self.config.image_prefix}{img_idx}{self.config.image_suffix}"
         
@@ -680,19 +619,16 @@ class HandDetectionPipeline:
             return False
         
         # Detect hands
-        results, angle = self.detect_hands_with_enhancement(image, hands)
-        if not results or not results.multi_hand_landmarks:
+        detections, _ = self.detect_hands_with_enhancement(image)
+        if len(detections) == 0:
             self.logger.info(f"No hands detected in {img_idx}")
             return False
         
-        if angle != 0:
-            self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
-        
         # Process based on number of hands
-        if len(results.multi_hand_landmarks) == 2:
-            data = self.process_double_hands(image, results, img_idx, hands, mp_drawing, mp_drawing_styles, mp_hands)
-        elif results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
-            data = self.process_single_hand(image, results, img_idx, hands, mp_drawing, mp_drawing_styles, mp_hands)
+        if len(detections) == 2:
+            data = self.process_double_hands(image, detections, img_idx)
+        elif len(detections) == 1:
+            data = self.process_single_hand(image, detections[0], img_idx)
         else:
             return False
         
@@ -774,9 +710,6 @@ class HandDetectionPipeline:
 
     def process_image(self, img_idx: str) -> bool:
         """Process a single image (legacy method for backward compatibility)"""
-        # Create MediaPipe instances
-        hands, mp_drawing, mp_drawing_styles, mp_hands = self.create_mediapipe_instance()
-        
         # Construct image path
         img_path = f"{self.config.input_path}/{self.config.image_prefix}{img_idx}{self.config.image_suffix}"
         
@@ -786,8 +719,8 @@ class HandDetectionPipeline:
             return False
         
         # Detect hands
-        results, angle = self.detect_hands_with_enhancement(image, hands)
-        if not results or not results.multi_hand_landmarks:
+        results, angle = self.detect_hands_with_enhancement(image)
+        if len(results) == 0:
             self.logger.info(f"No hands detected in {img_idx}")
             return False
         
@@ -795,10 +728,10 @@ class HandDetectionPipeline:
             self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
         
         # Process based on number of hands
-        if len(results.multi_hand_landmarks) == 2:
-            data = self.process_double_hands(image, results, img_idx, hands, mp_drawing, mp_drawing_styles, mp_hands)
-        elif results.multi_hand_landmarks and len(results.multi_hand_landmarks) > 0:
-            data = self.process_single_hand(image, results, img_idx, hands, mp_drawing, mp_drawing_styles, mp_hands)
+        if len(results) == 2:
+            data = self.process_double_hands(image, results, img_idx)
+        elif len(results) > 0:
+            data = self.process_single_hand(image, results[0], img_idx)
         else:
             return False
         
@@ -822,28 +755,29 @@ class HandDetectionPipeline:
         for idx in range(start_idx, end_idx):
             img_idx = f"{idx:06d}"
             
-            try:
-                if self.process_image(img_idx):
-                    processed_count += 1
-                else:
-                    failed_count += 1
-            except Exception as e:
-                self.logger.error(f"Error processing {img_idx}: {e}")
+            # try:
+            if self.process_image(img_idx):
+                processed_count += 1
+            else:
                 failed_count += 1
+            # except Exception as e:
+            #     self.logger.error(f"Error processing {img_idx}: {e}")
+            #     failed_count += 1
         
         self.logger.info(f"Single-threaded pipeline completed. Processed: {processed_count}, Failed: {failed_count}")
+        self.detector.release()
 
 
 def main():
     """Main execution function"""
     # Configure pipeline
-
     camera = "camera04"
     conf = 0.7
+    base_path = "../../data/input"
     config = PipelineConfig(
-        # input_path="data/input/tony/Marshall/camera05/images",
-        input_path=f"data/input/orbbec/{camera}",
-        output_path=f"test_diff_setup_2/conf_{conf:.1f}/{camera}",
+        input_path=f"{base_path}/orbbec/{camera}",
+        camera_path=f"{base_path}/",
+        output_path=f"../output/test_diff_setup_2/conf_{conf:.1f}/{camera}",
         camera_name=camera,
         orbbec_cam=True,
         min_detection_confidence=conf,
@@ -858,11 +792,11 @@ def main():
 
     start = time.time()
     
-    # Use multithreaded version for better performance
-    pipeline.run_multithreaded(start_idx=0, end_idx=200)
+    # Use multithreaded version
+    # pipeline.run_multithreaded(start_idx=0, end_idx=200)
     
     # Alternative: use single-threaded version
-    # pipeline.run(start_idx=100, end_idx=1000)
+    pipeline.run(start_idx=100, end_idx=1000)
     
     end = time.time()
     

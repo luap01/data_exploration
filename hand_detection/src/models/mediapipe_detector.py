@@ -21,6 +21,7 @@ class MediaPipeHandDetector(HandDetector):
         self.hands = None
         self.mp_drawing = None
         self.mp_drawing_styles = None
+        self.initialize()
     
     def initialize(self):
         """Initialize MediaPipe hands"""

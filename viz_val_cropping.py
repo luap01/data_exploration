@@ -18,12 +18,14 @@ img_idx = "000100"
 
 # BASE_PATH = "test_bbox_larger_shift_into_opposite"
 # BASE_PATH = "test_bbox"
-BASE_PATH = "test_bbox_rotation_test"
-for i in range(488, 492):
+BASE_PATH = "hand_detection/output/test_diff_setup_2/conf_0.7/camera04"
+for i in range(0, 400):
     img_idx = f"{i:06d}"
 
     if not os.path.exists(f"{BASE_PATH}/json/{img_idx}_test.json"):
+        print(f"Skipping {img_idx}: Json could not be loaded")
         continue
+
     left = cv2.imread(f"{BASE_PATH}/blanks/{img_idx}_cropped_256_left_blank.jpg")
     right = cv2.imread(f"{BASE_PATH}/blanks/{img_idx}_cropped_256_right_blank.jpg")
     orig = cv2.imread(f"{BASE_PATH}/original/{img_idx}_test.jpg")
@@ -37,6 +39,11 @@ for i in range(488, 492):
 
     lkps = np.array(kps['people'][0]['hand_left_keypoints_2d']).reshape(-1, 3)[:, :2]
     rkps = np.array(kps['people'][0]['hand_right_keypoints_2d']).reshape(-1, 3)[:, :2]
+
+    if len(lkps) == 0 or len(rkps) == 0:
+        print(f"Skipping {img_idx}: One or more keypoints could not be loaded")
+        continue
+    
     l_shift = np.array(kps['people'][0]['hand_left_shift'])
     r_shift = np.array(kps['people'][0]['hand_right_shift'])
 
