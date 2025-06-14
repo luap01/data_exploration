@@ -10,5 +10,6 @@ data_exp/
 
 #testing
 test_*/
+**/test_*/**
 
 test.ipynb
