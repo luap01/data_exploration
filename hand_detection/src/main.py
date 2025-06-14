@@ -287,34 +287,34 @@ class HandDetectionPipeline:
         if cam_config.direction == ShiftDirection.LEFT_RIGHT:
            
             # Original left-right behavior
-            if hand_side == "left":
-                bbox[:, 0] += shift  # Shift right for left hand
+            if hand_side == "right":
+                bbox[:, 0] += shift  # Shift right for right hand
                 bbox[2, 0] += shift
                 bbox[3, 0] += shift
             else:
-                bbox[:, 0] -= shift  # Shift left for right hand
+                bbox[:, 0] -= shift  # Shift left for left hand
                 bbox[0, 0] -= shift
                 bbox[1, 0] -= shift
                 
         elif cam_config.direction == ShiftDirection.UP_DOWN or cam_config.direction == ShiftDirection.DOWN_UP:
             if cam_config.direction == ShiftDirection.UP_DOWN:
                 # Vertical shift for cameras 2
-                if hand_side == "left":
-                    bbox[:, 1] += shift  # Shift down for left hand
+                if hand_side == "right":
+                    bbox[:, 1] += shift  # Shift down for right hand
                     bbox[1, 1] += shift
                     bbox[2, 1] += shift
                 else:
-                    bbox[:, 1] -= shift  # Shift up for right hand
+                    bbox[:, 1] -= shift  # Shift up for left hand
                     bbox[0, 1] -= shift
                     bbox[3, 1] -= shift
             else:
                 # Vertical shift for cameras 3
-                if hand_side == "left":
-                    bbox[:, 1] -= shift  # Shift down for left hand
+                if hand_side == "right":
+                    bbox[:, 1] -= shift  # Shift up for right hand
                     bbox[1, 1] -= shift
                     bbox[2, 1] -= shift
                 else:
-                    bbox[:, 1] += shift  # Shift up for right hand
+                    bbox[:, 1] += shift  # Shift down for left hand
                     bbox[0, 1] += shift
                     bbox[3, 1] += shift
         elif cam_config.direction == ShiftDirection.DIAGONAL:
@@ -451,6 +451,7 @@ class HandDetectionPipeline:
         
         # Retry mechanism for hand misclassification
         first_try = True
+        found = False
         retry = False
         fail = False
         prev_detected_handside = detection.hand_type
@@ -481,18 +482,17 @@ class HandDetectionPipeline:
                 if angle != 0:
                     self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
         
-                found = False
                 if len(cropped_results) > 0:
                     found = True
-                    if retry:
-                        # If we're in retry mode and found something, copy the previous data
-                        retry = False
-                        data["people"][0][f"hand_{current_hand_side}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
-                        data["people"][0][f"hand_{current_hand_side}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
-                        cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{current_hand_side}_blank.jpg", blank_img)
+                
+                if retry and found:
+                    # If we're in retry mode and found something, copy the previous data
+                    retry = False
+                    data["people"][0][f"hand_{current_hand_side}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
+                    data["people"][0][f"hand_{current_hand_side}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
+                    cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{current_hand_side}_blank.jpg", blank_img)
                 
                 first_try = False
-                
                 if found:
                     # Process the detected hand
                     detected_detection = cropped_results[0]
@@ -770,14 +770,21 @@ class HandDetectionPipeline:
 
 def main():
     """Main execution function"""
+    # Get script directory
+    script_dir = Path(__file__)
+    
     # Configure pipeline
     camera = "camera04"
     conf = 0.7
-    base_path = "../../data/input"
+    
+    # Build paths relative to script directory
+    base_path = script_dir.parent.parent.parent / "data" / "input"
+    output_path = script_dir.parent.parent / "output" / "test_diff_setup_2" / f"conf_{conf:.1f}" / camera
+    
     config = PipelineConfig(
-        input_path=f"{base_path}/orbbec/{camera}",
-        camera_path=f"{base_path}/",
-        output_path=f"../output/test_diff_setup_2/conf_{conf:.1f}/{camera}",
+        input_path=str(base_path / "orbbec" / camera),
+        camera_path=str(base_path),
+        output_path=str(output_path),
         camera_name=camera,
         orbbec_cam=True,
         min_detection_confidence=conf,
@@ -796,7 +803,7 @@ def main():
     # pipeline.run_multithreaded(start_idx=0, end_idx=200)
     
     # Alternative: use single-threaded version
-    pipeline.run(start_idx=100, end_idx=1000)
+    pipeline.run(start_idx=13, end_idx=14)
     
     end = time.time()
     
