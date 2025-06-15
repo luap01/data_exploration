@@ -35,7 +35,7 @@ class MediaPipeHandDetector(HandDetector):
         self.mp_drawing = mp.solutions.drawing_utils
         self.mp_drawing_styles = mp.solutions.drawing_styles
     
-    def detect_hands(self, image: np.ndarray) -> Tuple[List[HandDetection], Optional[np.ndarray]]:
+    def detect_hands(self, image: np.ndarray) -> List[HandDetection]:
         """Detect hands using MediaPipe"""
         if self.hands is None:
             self.initialize()
@@ -78,8 +78,8 @@ class MediaPipeHandDetector(HandDetector):
 
         # Extract keypoints
         for x, y, _ in detection.landmarks:
-            x = float(x * h) - x_min + x_orig
-            y = float(y * w) - y_min + y_orig
+            x = float(x * w) - x_min + x_orig
+            y = float(y * h) - y_min + y_orig
             keypoints.extend([x, y, 1.0])
         
         return {

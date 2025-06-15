@@ -4,92 +4,138 @@ from typing import List, Tuple, Optional, Dict, Any
 import sys
 from pathlib import Path
 
-# Add openpose_impl to path
-openpose_path = Path(__file__).parent.parent / "openpose_impl"
-if str(openpose_path) not in sys.path:
-    sys.path.append(str(openpose_path))
-
-from hand import Hand
-from model import Model
 from .hand_detector import HandDetector, HandDetection
+
+from .openpose_impl import model
+from .openpose_impl import util
+from .openpose_impl.body import Body
+from .openpose_impl.hand import Hand
 
 
 class OpenPoseHandDetector(HandDetector):
     """OpenPose implementation of hand detector"""
     
     def __init__(self, 
-                 model_path: Optional[str] = None,
                  max_num_hands: int = 2,
-                 min_detection_confidence: float = 0.5):
-        self.model_path = model_path
+                 min_detection_confidence: float = 0.0,
+                 min_tracking_confidence: float = 0.5,
+                 base_model_path: Optional[str] = None):
+        self.base_model_path = base_model_path or './openpose_impl/model/'
         self.max_num_hands = max_num_hands
         self.min_detection_confidence = min_detection_confidence
-        self.model = None
-        self.hand_detector = None
+        self.body_estimation = None
+        self.hand_estimation = None
+        self.initialize()
     
     def initialize(self):
-        """Initialize OpenPose hand detector"""
-        if self.model is None:
-            self.model = Model()
-            if self.model_path:
-                self.model.load_model(self.model_path)
-            self.hand_detector = Hand(self.model)
+        """Initialize OpenPose body and hand detectors"""
+        if self.body_estimation is None:
+            # Initialize both body and hand models as done in openpose.py
+            self.body_estimation = Body(str(Path(self.base_model_path) / 'body_pose_model.pth'))
+            self.hand_estimation = Hand(str(Path(self.base_model_path) / 'hand_pose_model.pth'))
     
-    def detect_hands(self, image: np.ndarray) -> Tuple[List[HandDetection], Optional[np.ndarray]]:
+    def detect_hands(self, image: np.ndarray) -> List[HandDetection]:
         """Detect hands using OpenPose"""
-        if self.hand_detector is None:
+        if self.body_estimation is None:
             self.initialize()
         
-        # Process image
-        hand_keypoints, annotated_image = self.hand_detector.detect(image)
+        # First detect body keypoints
+        candidate, subset = self.body_estimation(image)
+        hands_list = util.handDetect(candidate, subset, image)
         
         detections = []
-        if hand_keypoints is not None and len(hand_keypoints) > 0:
+        if len(hands_list) > 0:
             # Process each detected hand
-            for hand_idx in range(min(len(hand_keypoints), self.max_num_hands)):
-                keypoints = hand_keypoints[hand_idx]
-                
-                # Convert to normalized coordinates
-                h, w = image.shape[:2]
-                normalized_keypoints = keypoints.copy()
-                normalized_keypoints[:, 0] /= w
-                normalized_keypoints[:, 1] /= h
-                
-                # Determine hand type (OpenPose might need additional logic here)
-                # For now, we'll assume first hand is right and second is left
-                hand_type = "right" if hand_idx == 0 else "left"
-                
-                # Calculate confidence as mean of keypoint confidences
-                confidence = float(np.mean(keypoints[:, 2]))
-                
-                if confidence >= self.min_detection_confidence:
+            for hand_idx, (x, y, w, is_left) in enumerate(hands_list):
+                if hand_idx >= self.max_num_hands:
+                    break
+                    
+                # Extract and process hand region
+                hand_roi = image[y:y+w, x:x+w, :]
+                peaks, confidences = self.hand_estimation(hand_roi)
+                if peaks.shape[0] != confidences.shape[0]:
+                    print(f"PEAKS: {peaks.shape[0]} vs. CONF: {confidences.shape[0]}")
+                # Adjust peaks to image space
+                peaks[:, 0] = np.where(peaks[:, 0]==0, peaks[:, 0], peaks[:, 0]+x)
+                peaks[:, 1] = np.where(peaks[:, 1]==0, peaks[:, 1], peaks[:, 1]+y)
+
+                # Compute average confidence for hand detection
+                valid_confidences = confidences[confidences > 0]
+                avg_confidence = np.mean(valid_confidences) if len(valid_confidences) > 0 else 0.0
+                print(f"AVG CONF: {avg_confidence:.2f}")
+                if avg_confidence >= self.min_detection_confidence:
+                    # Convert to normalized coordinates
+                    h, w = image.shape[:2]
+                    normalized_peaks = peaks.astype(np.float64)  # Ensure float type
+                    normalized_peaks[:, 0] /= w
+                    normalized_peaks[:, 1] /= h
+                    normalized_peaks = np.column_stack((normalized_peaks, confidences))
+
                     detection = HandDetection(
-                        landmarks=normalized_keypoints,
-                        hand_type=hand_type,
-                        confidence=confidence
+                        landmarks=normalized_peaks,
+                        hand_type="left" if is_left else "right",
+                        confidence=avg_confidence
                     )
                     detections.append(detection)
-        
-        return detections, annotated_image
+        else:
+            peaks, confidences = self.hand_estimation(image)
+            # Compute average confidence for hand detection
+            valid_confidences = confidences[confidences > 0]
+            avg_confidence = np.mean(valid_confidences) if len(valid_confidences) > 0 else 0.0
+            if avg_confidence >= self.min_detection_confidence:
+                h, w = image.shape[:2]
+                normalized_peaks = peaks.astype(np.float64)  # Ensure float type
+                normalized_peaks[:, 0] /= w
+                normalized_peaks[:, 1] /= h
+                normalized_peaks = np.column_stack((normalized_peaks, confidences))
+                detection = HandDetection(
+                        landmarks=normalized_peaks,
+                        hand_type="",
+                        confidence=avg_confidence
+                )
+                detections.append(detection)
+
+        return detections
     
-    def get_keypoints_data(self, detection: HandDetection, image_shape: Tuple[int, int]) -> Dict[str, Any]:
+    def get_keypoints_data(self, detection: HandDetection, image_shape: Tuple[int, int], coord_origins: List[Tuple[int, int]]) -> Dict[str, Any]:
         """Convert OpenPose detection to keypoints data"""
         h, w = image_shape
         
+        # Calculate total offset
+        x_min, y_min = coord_origins[-1]
+        x_orig, y_orig = 0, 0
+        if len(coord_origins) > 1:
+            x_orig, y_orig = coord_origins[-2][0], coord_origins[-2][1] 
+
         # Convert normalized coordinates to pixel coordinates
         keypoints = []
         for x, y, c in detection.landmarks:
-            px = float(x * w)
-            py = float(y * h)
+            px = float(x * w) - x_min + x_orig
+            py = float(y * h) - y_min + y_orig
             keypoints.extend([px, py, c])
         
         return {
             f"hand_{detection.hand_type}_keypoints_2d": keypoints,
-            f"hand_{detection.hand_type}_shift": [0, 0]  # No shift for initial detection
+            f"hand_{detection.hand_type}_shift": [x_min, y_min]
         }
+    
+    def draw_landmarks(self, detection: HandDetection, image: np.array):
+        """Draw OpenPose landmarks on image"""
+        h, w = image.shape[:2]
+        
+        # Convert normalized coordinates to pixel coordinates for visualization
+        landmarks_pixel = []
+        for x, y, _ in detection.landmarks:
+            px = int(x * w)
+            py = int(y * h)
+            landmarks_pixel.append([px, py])
+            
+        landmarks_array = np.array(landmarks_pixel)
+        util.draw_handpose(image, [landmarks_array])
+        return image
     
     def release(self):
         """Release OpenPose resources"""
-        if self.model is not None:
-            self.model = None
-            self.hand_detector = None 
+        if self.body_estimation is not None:
+            self.body_estimation = None
+            self.hand_estimation = None 
