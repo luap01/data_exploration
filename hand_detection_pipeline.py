@@ -275,7 +275,7 @@ class HandDetectionPipeline:
         # Get camera-specific shift configuration
         cam_config = CameraShiftConfig.get_camera_config(self.config.camera_name, shift)
         
-        
+    
         # Apply camera-specific shifts
         if cam_config.direction == ShiftDirection.LEFT_RIGHT:
             # Expand ROI in all directions with a small base expansion
@@ -505,7 +505,12 @@ class HandDetectionPipeline:
         
         # Try shifted bbox approach with retry mechanism
         roi = self.get_roi_points(hand_landmarks, image.shape)
-        
+        bbox = self.compute_shifted_bbox(roi.copy(), hand_side)
+
+
+        orig_vis = self.draw_landmarks_and_bbox(image.copy(), hand_landmarks, bbox, roi, mp_drawing, mp_drawing_styles, mp_hands)
+        cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}.jpg", orig_vis)
+
         # Retry mechanism for hand misclassification
         first_try = True
         retry = False
@@ -585,7 +590,7 @@ class HandDetectionPipeline:
                     # Save shifted ROI visualization
                     full_vis = self.draw_landmarks_and_bbox(image, hand_landmarks, bbox, roi,
                                                            mp_drawing, mp_drawing_styles, mp_hands)
-                    cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}.jpg", full_vis)
+                                                        
                     
                     break  # Success, exit the retry loop
                     
@@ -605,8 +610,8 @@ class HandDetectionPipeline:
                         # Draw retry bbox visualization
                         retry_vis = self.draw_landmarks_and_bbox(retry_img, hand_landmarks, bbox_retry, roi,
                                                                mp_drawing, mp_drawing_styles, mp_hands)
-                        cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}_retry.jpg", retry_vis)
                         
+                        cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}_retry.jpg", retry_vis)                       
                     else:
                         # Both attempts failed
                         retry = False
@@ -838,7 +843,7 @@ def main():
     config = PipelineConfig(
         # input_path="data/input/tony/Marshall/camera05/images",
         input_path=f"data/input/orbbec/{camera}",
-        output_path=f"test_diff_setup_2/conf_{conf:.1f}/{camera}",
+        output_path=f"test_val/conf_{conf:.1f}/{camera}",
         camera_name=camera,
         orbbec_cam=True,
         min_detection_confidence=conf,
@@ -854,10 +859,10 @@ def main():
     start = time.time()
     
     # Use multithreaded version for better performance
-    pipeline.run_multithreaded(start_idx=0, end_idx=200)
+    # pipeline.run_multithreaded(start_idx=0, end_idx=200)
     
     # Alternative: use single-threaded version
-    # pipeline.run(start_idx=100, end_idx=1000)
+    pipeline.run(start_idx=13, end_idx=14)
     
     end = time.time()
     
