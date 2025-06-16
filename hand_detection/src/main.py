@@ -276,16 +276,6 @@ class HandDetectionPipeline:
         
         x_coords, y_coords = zip(*points)
         padding = self.config.roi_padding
-        
-        # min_x = min(x_coords)
-        # max_x = max(x_coords)
-        # min_y = min(y_coords)
-        # max_y = max(y_coords)
-
-        # if min_x == 0:
-        #     min_x = max_x
-        # if min_y == 0:
-        #     min_y = max_y
             
         roi_points = np.array([
             [min(x_coords) - padding, min(y_coords) - padding],
@@ -434,7 +424,7 @@ class HandDetectionPipeline:
         """Draw hand landmarks and bounding boxes on image"""
         result_img = image.copy()
         
-        if detection and detection.landmarks.size() > 0:
+        if detection and len(detection.landmarks) > 0:
             self.detector.draw_landmarks(detection, result_img)
         
         # Draw bounding box
@@ -455,10 +445,10 @@ class HandDetectionPipeline:
         
         return result_img
     
-    def check_diff_hand(self, detection: HandDetection, current_hand_side: str, prev_detected_handside: str, cropped_img: np.ndarray, bbox_origin: np.ndarray, data: Dict[str, List[Dict]]) -> Tuple[Dict[str, List[Dict]], bool]:
+    def check_diff_hand(self, detection: HandDetection, current_hand_side: str, prev_detected_handside: str, cropped_img: np.ndarray, bbox_origin: np.ndarray, final_origin: np.ndarray, data: Dict[str, List[Dict]]) -> Tuple[Dict[str, List[Dict]], bool]:
         temp_keypoint_data = self.detector.get_keypoints_data(
             detection, cropped_img.shape[:2], 
-            [bbox_origin]
+            [bbox_origin, final_origin]
         )
     
         tmp_data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], 
@@ -472,8 +462,8 @@ class HandDetectionPipeline:
         # Check if the detected hand is actually different
         diff = self.comp_shift_diff(tmp_data)
 
-        if diff > 100:
-            return temp_keypoint_data, True
+        if diff > 200:
+            return tmp_data, True
         else:
             return None, False 
 
@@ -498,23 +488,27 @@ class HandDetectionPipeline:
                 detected_hand_side = "right" if current_hand_side == "left" else "left"
                 detected_detection.hand_type = detected_hand_side
                 temp = data.copy()
+
+                # Create final crop from original image using detected landmarks
+                final_crop, final_origin = self.crop_fixed_size(
+                        image.copy(), detected_detection, 
+                        base_offset=bbox_origin, 
+                        current_image_size=cropped_img.shape[:2]
+                )
+
                 if retry_counter >= 2:
                     temp["people"][0][f"hand_{current_hand_side}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
                     temp["people"][0][f"hand_{current_hand_side}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
                     cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{current_hand_side}_blank.jpg", blank_img)
-                tmp_data, check = self.check_diff_hand(detected_detection, current_hand_side, prev_detected_handside, cropped_img, bbox_origin, temp)
+                    tmp_data, check = self.check_diff_hand(detected_detection, prev_detected_handside, current_hand_side, cropped_img, bbox_origin, final_origin, temp)
+                else:    
+                    tmp_data, check = self.check_diff_hand(detected_detection, current_hand_side, prev_detected_handside, cropped_img, bbox_origin, final_origin, temp)
                 if check:
-                    # Create final crop from original image using detected landmarks
-                    final_crop, final_origin = self.crop_fixed_size(
-                        image, detected_detection, 
-                        base_offset=bbox_origin, 
-                        current_image_size=cropped_img.shape[:2]
-                    )
                     cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{detected_hand_side}_blank.jpg", final_crop)
                     return tmp_data
 
             if retry_counter % 2 == 0:
-                shift_multiplier = 2
+                shift_multiplier = 1.5
             else:
                 shift_multiplier = 1
                 prev_detected_handside = current_hand_side
