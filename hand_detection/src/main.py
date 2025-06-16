@@ -296,11 +296,11 @@ class HandDetectionPipeline:
         
         return roi_points
     
-    def compute_shifted_bbox(self, roi: np.ndarray, hand_side: str) -> np.ndarray:
+    def compute_shifted_bbox(self, roi: np.ndarray, hand_side: str, shift_multiplier: float = 1.0) -> np.ndarray:
         """Compute shifted bounding box based on camera configuration"""
         bbox = roi.copy()
         shift = self.config.bbox_shift
-        half_shift = shift // 2
+        half_shift = shift // 2 
         
         # Get camera-specific shift configuration
         cam_config = CameraShiftConfig.get_camera_config(self.config.camera_name, shift)
@@ -314,6 +314,9 @@ class HandDetectionPipeline:
         bbox[2, 1] += shift         # bottom-right: down
         bbox[3, 0] += half_shift    # top-right: right
         bbox[3, 1] -= shift         # top-right: up
+        
+        # Convert shift to integer after applying multiplier
+        shift = int(shift * shift_multiplier)
         
         # Apply camera-specific shifts
         if cam_config.direction == ShiftDirection.LEFT_RIGHT:
@@ -431,7 +434,8 @@ class HandDetectionPipeline:
         """Draw hand landmarks and bounding boxes on image"""
         result_img = image.copy()
         
-        self.detector.draw_landmarks(detection, result_img)
+        if detection and detection.landmarks.size() > 0:
+            self.detector.draw_landmarks(detection, result_img)
         
         # Draw bounding box
         for x, y in bbox:
@@ -451,138 +455,72 @@ class HandDetectionPipeline:
         
         return result_img
     
+    def check_diff_hand(self, detection: HandDetection, current_hand_side: str, prev_detected_handside: str, cropped_img: np.ndarray, bbox_origin: np.ndarray, data: Dict[str, List[Dict]]) -> Tuple[Dict[str, List[Dict]], bool]:
+        temp_keypoint_data = self.detector.get_keypoints_data(
+            detection, cropped_img.shape[:2], 
+            [bbox_origin]
+        )
+    
+        tmp_data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], 
+                    "hand_right_shift": [], "hand_right_keypoints_2d": []}]}
+
+        # Store current data
+        temp_keypoint_data[f"hand_{prev_detected_handside}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
+        temp_keypoint_data[f"hand_{prev_detected_handside}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
+        tmp_data['people'][0].update(temp_keypoint_data)
+
+        # Check if the detected hand is actually different
+        diff = self.comp_shift_diff(tmp_data)
+
+        if diff > 100:
+            return temp_keypoint_data, True
+        else:
+            return None, False 
+
+    
     def detect_second_hand_or_retry(self, img_idx: int, image: np.ndarray, blank_img: np.ndarray, detection: HandDetection, roi: np.ndarray, data: Dict[str, List[Dict]]) -> None:
-        # Retry mechanism for hand misclassification
-        first_try = True
-        found = False
-        retry = False
-        fail = False
-        prev_detected_handside = detection.hand_type
-        current_hand_side = prev_detected_handside
-        original_bbox = None  # Store original bbox for failure visualization
-        count = 0
+        """Detect second hand with retry mechanism for hand misclassification"""
+        current_hand_side = detection.hand_type
+        prev_detected_handside = current_hand_side
+        shift_multiplier = 1.0
 
-        while first_try or retry:
-            try:
-                bbox = self.compute_shifted_bbox(roi.copy(), current_hand_side)
-                
-                # Store original bbox for failure visualization
-                if first_try:
-                    original_bbox = bbox.copy()
-                
-                # Crop to shifted bbox
-                cropped_img, bbox_origin = self.crop_to_bbox(image.copy(), bbox)
-                
-                # Use single_hand_detector for cropped region detection
-                cropped_results, angle = self.detect_hands_with_enhancement(cropped_img)
-                
-                if angle != 0:
-                    self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
-        
-                if len(cropped_results) > 0:
-                    found = True
-                
-                if retry and found:
-                    # If we're in retry mode and found something, copy the previous data
-                    retry = False
-                    data["people"][0][f"hand_{current_hand_side}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
-                    data["people"][0][f"hand_{current_hand_side}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
+        for retry_counter in range(0, 4):
+            # Attempt hand detection
+            bbox = self.compute_shifted_bbox(roi.copy(), current_hand_side, shift_multiplier)
+            cropped_img, bbox_origin = self.crop_to_bbox(image.copy(), bbox)
+            cropped_results, _ = self.detect_hands_with_enhancement(cropped_img)
+
+            full_vis = self.draw_landmarks_and_bbox(image.copy(), None, bbox, roi)
+            cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}_{retry_counter}.jpg", full_vis)
+
+            if len(cropped_results) > 0:
+                detected_detection = cropped_results[0]
+                detected_hand_side = "right" if current_hand_side == "left" else "left"
+                detected_detection.hand_type = detected_hand_side
+                temp = data.copy()
+                if retry_counter >= 2:
+                    temp["people"][0][f"hand_{current_hand_side}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
+                    temp["people"][0][f"hand_{current_hand_side}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
                     cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{current_hand_side}_blank.jpg", blank_img)
-                
-                first_try = False
-                if found: # and count < 3:
-                    # Process the detected hand
-                    detected_detection = cropped_results[0]
-                    detected_hand_side = "right" if current_hand_side == "left" else "left"
-                    detected_detection.hand_type = detected_hand_side
-
+                tmp_data, check = self.check_diff_hand(detected_detection, current_hand_side, prev_detected_handside, cropped_img, bbox_origin, temp)
+                if check:
                     # Create final crop from original image using detected landmarks
                     final_crop, final_origin = self.crop_fixed_size(
                         image, detected_detection, 
                         base_offset=bbox_origin, 
                         current_image_size=cropped_img.shape[:2]
                     )
-                    
-                    # Update keypoints data
-                    final_keypoint_data = self.detector.get_keypoints_data(
-                        detected_detection, cropped_img.shape[:2], 
-                        [bbox_origin, final_origin]
-                    )
-                    data["people"][0].update(final_keypoint_data)
-                    
-                    # Save final crops
                     cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{detected_hand_side}_blank.jpg", final_crop)
-                    
-                    # Create visualization of cropped region
-                    vis_cropped = self.draw_landmarks_and_bbox(
-                        cropped_img, 
-                        detected_detection, 
-                        bbox=self.compute_shifted_bbox(
-                            self.get_roi_points(detected_detection, cropped_img.shape), 
-                            detected_hand_side
-                        ), 
-                        roi=self.get_roi_points(detected_detection, cropped_img.shape)
-                    )
-                    
-                    final_vis_crop, _ = self.crop_fixed_size(vis_cropped, detected_detection)
-                    cv2.imwrite(self.dirs['preds'] / f"{img_idx}_cropped_256_{detected_hand_side}.jpg", final_vis_crop)
-                    
-                    # Save shifted ROI visualization
-                    full_vis = self.draw_landmarks_and_bbox(image, detection, bbox, roi)
-                    cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}.jpg", full_vis)
-                    
-                    diff = self.comp_shift_diff(data)
-                    # if diff > 100:
-                    #     break  # Success, exit the retry loop
-                    # else:
-                    #     retry = True
-                    #     prev_detected_handside = detected_hand_side
-                    #     current_hand_side = "left" if prev_detected_handside == "right" else "right"
-                    #     count += 1
-                    #     self.logger.info(f"Correcting {img_idx} first prediction with diff {diff}...")
-                    #     bbox_retry = self.compute_shifted_bbox(roi.copy(), current_hand_side)
-                else:
-                    # No hand detected, try retry logic
-                    if not retry: # and count < 3:
-                        retry = True
-                        prev_detected_handside = current_hand_side
-                        current_hand_side = "left" if prev_detected_handside == "right" else "right"
-                        
-                        self.logger.info(f"Retrying {img_idx} with {current_hand_side} hand classification")
-                        
-                        # Create retry visualization
-                        retry_img = image.copy()
-                        bbox_retry = self.compute_shifted_bbox(roi.copy(), current_hand_side)
-                        
-                        # Draw retry bbox visualization
-                        retry_vis = self.draw_landmarks_and_bbox(retry_img, detection, bbox_retry, roi)
-                        cv2.imwrite(self.dirs['shifted_roi'] / f"{img_idx}_test_{self.config.bbox_shift}_retry.jpg", retry_vis)
-                        
-                    else:
-                        # Both attempts failed
-                        retry = False
-                        fail = True
-                        self.logger.warning(f"Failed to detect second hand for {img_idx}")
-                        
-                        # Save failure images
-                        cv2.imwrite(self.dirs['failed'] / f"{img_idx}_test_{self.config.bbox_shift}_retry.jpg", retry_vis)
-                        original_vis = self.draw_landmarks_and_bbox(image, detection, original_bbox, roi)
-                        cv2.imwrite(self.dirs['failed'] / f"{img_idx}_test_{self.config.bbox_shift}.jpg", original_vis)
-                        break
-                        
-            except Exception as e:
-                self.logger.error(f"Error in retry loop for {img_idx}: {e}")
-                if not retry:
-                    retry = True
-                    prev_detected_handside = current_hand_side
-                    current_hand_side = "left" if prev_detected_handside == "right" else "right"
-                else:
-                    fail = True
-                    break
-        
-        if fail:
-            return None
+                    return tmp_data
 
+            if retry_counter % 2 == 0:
+                shift_multiplier = 2
+            else:
+                shift_multiplier = 1
+                prev_detected_handside = current_hand_side
+                current_hand_side = "right" if current_hand_side == "left" else "left"
+        
+        return None
     
     def process_single_hand(self, image: np.ndarray, detection: HandDetection, img_idx: str) -> Optional[Dict[str, Any]]:
         """Process image with single hand detection"""
@@ -621,10 +559,8 @@ class HandDetectionPipeline:
             min_tracking_confidence=self.config.min_tracking_confidence
         )
 
-        # do first time
-
-        # retry mechanism
-        self.detect_second_hand_or_retry(img_idx, image, blank_img, detection, roi, data)
+        # try to detect second hand
+        data = self.detect_second_hand_or_retry(img_idx, image, blank_img, detection, roi, data)
         
         self.detector.__init__(
             max_num_hands=2, 
@@ -782,7 +718,7 @@ class HandDetectionPipeline:
             return False
         
         if angle != 0:
-            self.logger.info(f"Hands detected in {img_idx} using {angle}° rotation")
+            self.logger.debug(f"Hands detected in {img_idx} using {angle}° rotation")
         
         # Process based on number of hands
         if len(results) == 2:
@@ -834,7 +770,7 @@ def main():
     model = "mediapipe"
     camera = "camera05"
     orbbec_cam = True if camera not in ['camera05', 'camera06'] else False
-    conf = 0.7
+    conf = 0.5
     
     # Build paths relative to script directory
     base_path = script_dir.parent.parent.parent / "data" / "input"
@@ -863,7 +799,7 @@ def main():
     # pipeline.run_multithreaded(start_idx=0, end_idx=200)
     
     # Alternative: use single-threaded version
-    pipeline.run(start_idx=0, end_idx=1)
+    pipeline.run(start_idx=0, end_idx=20)
     
     end = time.time()
     
