@@ -20,11 +20,11 @@ from models.mediapipe_detector import MediaPipeHandDetector
 from models.openpose_detector import OpenPoseHandDetector
 
 class ShiftDirection(Enum):
-    LEFT_RIGHT = "left_right"  # Original behavior (cameras 1, 5, 6)
-    UP_DOWN = "up_down"        # For cameras 2
-    DOWN_UP = "down_up"        # For camera 3
-    DIAGONAL = "diagonal"      # For camera 4
-
+    LEFT_RIGHT = "left_right"                   # Original behavior (cameras 1, 5)
+    UP_DOWN = "up_down"                         # For cameras 2
+    DOWN_UP = "down_up"                         # For camera 3
+    DIAGONAL_DOWN_LEFT = "diagonal_down_left"   # For camera 4
+    DIAGONAL_UP_LEFT = "diagonal_up_left"       # For camera 6
 
 @dataclass
 class CameraShiftConfig:
@@ -40,9 +40,9 @@ class CameraShiftConfig:
             "camera01": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
             "camera02": CameraShiftConfig(ShiftDirection.UP_DOWN, base_shift),
             "camera03": CameraShiftConfig(ShiftDirection.DOWN_UP, base_shift),
-            "camera04": CameraShiftConfig(ShiftDirection.DIAGONAL, base_shift),
+            "camera04": CameraShiftConfig(ShiftDirection.DIAGONAL_DOWN_LEFT, base_shift),
             "camera05": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
-            "camera06": CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift),
+            "camera06": CameraShiftConfig(ShiftDirection.DIAGONAL_UP_LEFT, base_shift),
         }
         return configs.get(camera_name, CameraShiftConfig(ShiftDirection.LEFT_RIGHT, base_shift))
 
@@ -342,17 +342,26 @@ class HandDetectionPipeline:
                     bbox[:, 1] += shift  # Shift up for right hand
                     bbox[0, 1] += shift
                     bbox[3, 1] += shift
-        elif cam_config.direction == ShiftDirection.DIAGONAL:
-
+        elif cam_config.direction == ShiftDirection.DIAGONAL_DOWN_LEFT:
             # Diagonal shift for camera 4
             if hand_side == "right":
-                # Shift down-left for left hand
+                # Shift down-left for right hand
                 bbox[:, 0] -= shift     # Shift left
                 bbox[:, 1] += shift     # Shift down
             else:
-                # Shift up-right for right hand
+                # Shift up-right for left hand
                 bbox[:, 0] += shift     # Shift right
                 bbox[:, 1] -= shift     # Shift up
+        elif cam_config.direction == ShiftDirection.DIAGONAL_UP_LEFT:
+            # Diagonal shift for camera 6
+            if hand_side == "right":
+                # Shift up-left for right hand
+                bbox[:, 0] -= shift     # Shift left
+                bbox[:, 1] -= shift     # Shift up
+            else:
+                # Shift down-right for left hand
+                bbox[:, 0] += shift     # Shift right
+                bbox[:, 1] += shift     # Shift down
         
         return bbox
     
@@ -451,12 +460,13 @@ class HandDetectionPipeline:
             [bbox_origin, final_origin]
         )
     
-        tmp_data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], 
-                    "hand_right_shift": [], "hand_right_keypoints_2d": []}]}
+        tmp_data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], "hand_left_conf": [],
+                    "hand_right_shift": [], "hand_right_keypoints_2d": [], "hand_right_conf": []}]}
 
         # Store current data
         temp_keypoint_data[f"hand_{prev_detected_handside}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
         temp_keypoint_data[f"hand_{prev_detected_handside}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
+        temp_keypoint_data[f"hand_{prev_detected_handside}_conf"] = data["people"][0][f"hand_{prev_detected_handside}_conf"]
         tmp_data['people'][0].update(temp_keypoint_data)
 
         # Check if the detected hand is actually different
@@ -467,7 +477,6 @@ class HandDetectionPipeline:
         else:
             return None, False 
 
-    
     def detect_second_hand_or_retry(self, img_idx: int, image: np.ndarray, blank_img: np.ndarray, detection: HandDetection, roi: np.ndarray, data: Dict[str, List[Dict]]) -> None:
         """Detect second hand with retry mechanism for hand misclassification"""
         current_hand_side = detection.hand_type
@@ -499,6 +508,7 @@ class HandDetectionPipeline:
                 if retry_counter >= 2:
                     temp["people"][0][f"hand_{current_hand_side}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
                     temp["people"][0][f"hand_{current_hand_side}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
+                    temp["people"][0][f"hand_{current_hand_side}_conf"] = data["people"][0][f"hand_{prev_detected_handside}_conf"]
                     cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{current_hand_side}_blank.jpg", blank_img)
                     tmp_data, check = self.check_diff_hand(detected_detection, prev_detected_handside, current_hand_side, cropped_img, bbox_origin, final_origin, temp)
                 else:    
@@ -521,8 +531,8 @@ class HandDetectionPipeline:
         self.logger.info(f"Processing {img_idx}: {detection.hand_type} hand detected")
         
         # Initialize data structure
-        data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], 
-                           "hand_right_shift": [], "hand_right_keypoints_2d": []}]}
+        data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], "hand_left_conf": [], 
+                           "hand_right_shift": [], "hand_right_keypoints_2d": [], "hand_right_conf": []}]}
         
         # Initial crop from original image
         blank_img, crop_origin = self.crop_fixed_size(image.copy(), detection)
@@ -569,11 +579,18 @@ class HandDetectionPipeline:
         self.logger.info(f"Processing {img_idx}: 2 hands detected")
         
         # Initialize data structure
-        data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], 
-                           "hand_right_shift": [], "hand_right_keypoints_2d": []}]}
+        data = {"people": [{"hand_left_shift": [], "hand_left_keypoints_2d": [], "hand_left_conf": [],
+                           "hand_right_shift": [], "hand_right_keypoints_2d": [], "hand_left_conf": []}]}
         
         # Save original image
         cv2.imwrite(self.dirs['original'] / f"{img_idx}_test.jpg", image)
+
+        if detections[0].landmarks[0][0] < detections[1].landmarks[0][0]:
+            detections[0].hand_type = "left"
+            detections[1].hand_type = "right"
+        else:
+            detections[0].hand_type = "right"
+            detections[1].hand_type = "left"
 
         # Process both hands
         for detection in detections:
@@ -762,9 +779,9 @@ def main():
     
     # Configure pipeline
     model = "mediapipe"
-    camera = "camera05"
+    camera = "camera03"
     orbbec_cam = True if camera not in ['camera05', 'camera06'] else False
-    conf = 0.5
+    conf = 0.35
     
     # Build paths relative to script directory
     base_path = script_dir.parent.parent.parent / "data" / "input"
