@@ -89,22 +89,8 @@ class HandDetectionPipeline:
         self.setup_output_dirs()
         self.load_camera_params()
 
-
-        if self.config.model == "mediapipe":
-            # Initialize detector
-            self.detector = MediaPipeHandDetector(
-                max_num_hands=self.config.max_num_hands,
-                min_detection_confidence=self.config.min_detection_confidence,
-                min_tracking_confidence=self.config.min_tracking_confidence
-            )
-        elif self.config.model == "openpose":
-            self.detector = OpenPoseHandDetector(
-                max_num_hands=self.config.max_num_hands,
-                min_detection_confidence=self.config.min_detection_confidence,
-                min_tracking_confidence=self.config.min_tracking_confidence
-            )
-        else:
-            raise ValueError(f"{self.config.model} implementation not existant...")
+        # Thread-local storage for detectors
+        self.thread_local = threading.local()
         
         # Thread-safe counters
         self.processed_count = 0
@@ -502,10 +488,21 @@ class HandDetectionPipeline:
         prev_detected_handside = current_hand_side
         shift_multiplier = 1.0
 
+        # Get thread-local detector and temporarily set to single hand mode
+        detector = self.get_thread_local_detector()
+        detector.__init__(
+            max_num_hands=1, 
+            min_detection_confidence=self.config.min_detection_confidence, 
+            min_tracking_confidence=self.config.min_tracking_confidence
+        )
+
         for retry_counter in range(0, 4):
             # Attempt hand detection
             bbox = self.compute_shifted_bbox(roi.copy(), current_hand_side, shift_multiplier)
             cropped_img, bbox_origin = self.crop_to_bbox(image.copy(), bbox)
+            
+            # Use thread-local detector
+            self.detector = detector
             cropped_results, _ = self.detect_hands_with_enhancement(cropped_img)
 
             full_vis = self.draw_landmarks_and_bbox(image.copy(), None, bbox, roi)
@@ -526,7 +523,6 @@ class HandDetectionPipeline:
 
                 cv2.imwrite(self.dirs['preds'] / f"{img_idx}_cropped_256_{detected_hand_side}_blank.jpg", final_crop)
 
-
                 if retry_counter >= 2:
                     temp["people"][0][f"hand_{current_hand_side}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
                     temp["people"][0][f"hand_{current_hand_side}_shift"] = data["people"][0][f"hand_{prev_detected_handside}_shift"]
@@ -537,6 +533,13 @@ class HandDetectionPipeline:
                     tmp_data, check = self.check_diff_hand(detected_detection, current_hand_side, prev_detected_handside, cropped_img, bbox_origin, final_origin, temp)
                 if check:
                     cv2.imwrite(self.dirs['blanks'] / f"{img_idx}_cropped_256_{detected_hand_side}_blank.jpg", final_crop)
+                    
+                    # Reset detector to original configuration before returning
+                    detector.__init__(
+                        max_num_hands=self.config.max_num_hands,
+                        min_detection_confidence=self.config.min_detection_confidence,
+                        min_tracking_confidence=self.config.min_tracking_confidence
+                    )
                     return tmp_data
 
             if retry_counter % 2 == 0:
@@ -546,6 +549,12 @@ class HandDetectionPipeline:
                 prev_detected_handside = current_hand_side
                 current_hand_side = "right" if current_hand_side == "left" else "left"
         
+        # Reset detector to original configuration before returning
+        detector.__init__(
+            max_num_hands=self.config.max_num_hands,
+            min_detection_confidence=self.config.min_detection_confidence,
+            min_tracking_confidence=self.config.min_tracking_confidence
+        )
         return None
     
     def process_single_hand(self, image: np.ndarray, detection: HandDetection, img_idx: str) -> Optional[Dict[str, Any]]:
@@ -577,13 +586,6 @@ class HandDetectionPipeline:
         
         # Try shifted bbox approach with retry mechanism
         roi = self.get_roi_points(detection, image.shape)
-
-        # Create a new MediaPipe instance with max_hands=1 for retry logic
-        self.detector.__init__(
-            max_num_hands=1, 
-            min_detection_confidence=self.config.min_detection_confidence, 
-            min_tracking_confidence=self.config.min_tracking_confidence
-        )
 
         # try to detect second hand
         data = self.detect_second_hand_or_retry(img_idx, image, blank_img, detection, roi, data)
@@ -668,15 +670,39 @@ class HandDetectionPipeline:
         
         return True
     
+    def get_thread_local_detector(self):
+        """Get or create a thread-local detector instance"""
+        if not hasattr(self.thread_local, 'detector'):
+            if self.config.model == "mediapipe":
+                self.thread_local.detector = MediaPipeHandDetector(
+                    max_num_hands=self.config.max_num_hands,
+                    min_detection_confidence=self.config.min_detection_confidence,
+                    min_tracking_confidence=self.config.min_tracking_confidence
+                )
+            elif self.config.model == "openpose":
+                self.thread_local.detector = OpenPoseHandDetector(
+                    max_num_hands=self.config.max_num_hands,
+                    min_detection_confidence=self.config.min_detection_confidence,
+                    min_tracking_confidence=self.config.min_tracking_confidence
+                )
+            else:
+                raise ValueError(f"{self.config.model} implementation not existant...")
+        return self.thread_local.detector
+
     def process_batch(self, indices: List[int]) -> Tuple[int, int]:
         """Process a batch of images and return (processed_count, failed_count)"""
         batch_processed = 0
         batch_failed = 0
         
+        # Get thread-local detector
+        detector = self.get_thread_local_detector()
+        
         for idx in indices:
             img_idx = f"{idx:06d}"
             
             try:
+                # Temporarily set the detector for this thread
+                self.detector = detector
                 if self.process_image_thread_safe(img_idx):
                     batch_processed += 1
                 else:
@@ -855,7 +881,7 @@ def main():
         run_time = run_end - run_start
         pipeline.logger.info(f"Entire run execution time: {run_time:.2f} seconds")
     else:
-        camera = "camera05"
+        camera = "camera06"
         orbbec_cam = True if camera not in ['camera05', 'camera06'] else False
         conf = 0.4
         min_tracking_confidence = 0.75
@@ -888,7 +914,7 @@ def main():
         # pipeline.run_multithreaded(start_idx=0, end_idx=200)
         
         # Alternative: use single-threaded version
-        pipeline.run(start_idx=0, end_idx=20)
+        pipeline.run(start_idx=0, end_idx=200)
         
         end = time.time()
         
