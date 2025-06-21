@@ -1,0 +1,74 @@
+import numpy as np
+import json
+import os
+
+def json_load(p):
+    with open(p, 'r') as fi:
+        d = json.load(fi)
+    return d
+
+def save_file(data, path):
+    with open(path, "w") as json_file:
+        json.dump(data, json_file, indent=4)
+
+def build_arr(data, hand_side):
+    kps = data[f"hand_{hand_side}_keypoints_2d"]
+    conf = data[f"hand_{hand_side}_conf"]
+    shift = data[f"hand_{hand_side}_shift"]
+    coords = []
+    confs = []
+    for idx in range(0, len(kps), 3):
+        coords.append(kps[idx])
+        coords.append(kps[idx+1])
+        confs.append(conf[0])
+    return [coords, confs, shift]
+
+if __name__ == "__main__":
+    # Get the directory where this script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Build paths relative to the script location
+    base_path = os.path.join(script_dir, "..", "hand_detection", "output", "test", "mediapipe", "conf_0.40")
+    tar_base_path = os.path.join(script_dir, "..", "..", "HaMuCo", "data", "OR", "rgb_2D_keypoints")
+    
+    directories = os.listdir(base_path)
+    for camera_name in directories:
+        files = os.listdir(f"{base_path}/{camera_name}/json")
+        count = 0
+        idx = 0
+        for file in files:
+            if any(substr in file for substr in ['000004', '000012', '000018', '000019']):
+                continue
+            try:
+                data = json_load(os.path.join(base_path, camera_name, "json", file))
+
+                if len(data["people"]) > 0:
+                    res_left = build_arr(data["people"][0], "right" if camera_name != "camera03" else "left")
+                    res_right = build_arr(data["people"][0], "left" if camera_name != "camera03" else "right")
+                else:
+                    print(file)
+                    count += 1
+                    arr = [0] * 63
+                    res_right = build_arr(arr)
+                    res_left = build_arr(arr)
+                
+                # Create target paths relative to script location
+                # camera_name = os.path.basename(base_path)
+                # file_prefix = file.split('_')[0]
+                
+                tar_pth_right = os.path.join(tar_base_path, "right", camera_name, f"{idx:06d}.json")
+                tar_pth_left = os.path.join(tar_base_path, "left", camera_name, f"{idx:06d}.json")
+                
+                # Create directories if they don't exist
+                os.makedirs(os.path.dirname(tar_pth_right), exist_ok=True)
+                os.makedirs(os.path.dirname(tar_pth_left), exist_ok=True)
+                
+                save_file(res_right, tar_pth_right)
+                save_file(res_left, tar_pth_left)
+
+                idx += 1
+            except IndexError:
+                pass
+    
+    print(count)
+    print(idx)

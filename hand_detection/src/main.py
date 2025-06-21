@@ -297,20 +297,24 @@ class HandDetectionPipeline:
         
         # Expand ROI in all directions with a small base expansion
         bbox[0, 0] -= half_shift    # top-left: left
-        bbox[0, 1] -= shift         # top-left: up
+        bbox[0, 1] -= half_shift         # top-left: up
         bbox[1, 0] -= half_shift    # bottom-left: left
-        bbox[1, 1] += shift         # bottom-left: down
+        bbox[1, 1] += half_shift         # bottom-left: down
         bbox[2, 0] += half_shift    # bottom-right: right 
-        bbox[2, 1] += shift         # bottom-right: down
+        bbox[2, 1] += half_shift         # bottom-right: down
         bbox[3, 0] += half_shift    # top-right: right
-        bbox[3, 1] -= shift         # top-right: up
+        bbox[3, 1] -= half_shift         # top-right: up
         
         # Convert shift to integer after applying multiplier
         shift = int(shift * shift_multiplier)
         
         # Apply camera-specific shifts
         if cam_config.direction == ShiftDirection.LEFT_RIGHT:
-           
+            bbox[0, 1] -= half_shift    # top-left: up
+            bbox[1, 1] += half_shift    # bottom-left: down
+            bbox[2, 1] += half_shift    # bottom-right: down
+            bbox[3, 1] -= half_shift    # top-right: up
+            
             # Original left-right behavior
             if hand_side == "left":
                 bbox[:, 0] += shift  # Shift right for left hand
@@ -322,6 +326,11 @@ class HandDetectionPipeline:
                 bbox[1, 0] -= shift
                 
         elif cam_config.direction == ShiftDirection.UP_DOWN or cam_config.direction == ShiftDirection.DOWN_UP:
+            bbox[0, 0] -= half_shift    # top-left: left
+            bbox[1, 0] -= half_shift    # bottom-left: left
+            bbox[2, 0] += half_shift    # bottom-right: right
+            bbox[3, 0] += half_shift    # top-right: right
+
             if cam_config.direction == ShiftDirection.UP_DOWN:
                 # Vertical shift for cameras 2
                 if hand_side == "left":
@@ -343,6 +352,11 @@ class HandDetectionPipeline:
                     bbox[0, 1] += shift
                     bbox[3, 1] += shift
         elif cam_config.direction == ShiftDirection.DIAGONAL_DOWN_LEFT:
+            bbox[0, 1] -= half_shift    # top-left: up
+            bbox[1, 1] += half_shift    # bottom-left: down
+            bbox[2, 1] += half_shift    # bottom-right: down
+            bbox[3, 1] -= half_shift    # top-right: up
+
             # Diagonal shift for camera 4
             if hand_side == "right":
                 # Shift down-left for right hand
@@ -353,6 +367,11 @@ class HandDetectionPipeline:
                 bbox[:, 0] += shift     # Shift right
                 bbox[:, 1] -= shift     # Shift up
         elif cam_config.direction == ShiftDirection.DIAGONAL_UP_LEFT:
+            bbox[0, 1] -= half_shift    # top-left: up
+            bbox[1, 1] += half_shift    # bottom-left: down
+            bbox[2, 1] += half_shift    # bottom-right: down
+            bbox[3, 1] -= half_shift    # top-right: up
+
             # Diagonal shift for camera 6
             if hand_side == "right":
                 # Shift up-left for right hand
@@ -472,7 +491,7 @@ class HandDetectionPipeline:
         # Check if the detected hand is actually different
         diff = self.comp_shift_diff(tmp_data)
 
-        if diff > 200:
+        if diff > 175:
             return tmp_data, True
         else:
             return None, False 
@@ -504,6 +523,9 @@ class HandDetectionPipeline:
                         base_offset=bbox_origin, 
                         current_image_size=cropped_img.shape[:2]
                 )
+
+                cv2.imwrite(self.dirs['preds'] / f"{img_idx}_cropped_256_{detected_hand_side}_blank.jpg", final_crop)
+
 
                 if retry_counter >= 2:
                     temp["people"][0][f"hand_{current_hand_side}_keypoints_2d"] = data["people"][0][f"hand_{prev_detected_handside}_keypoints_2d"]
@@ -779,44 +801,100 @@ def main():
     
     # Configure pipeline
     model = "mediapipe"
-    camera = "camera03"
-    orbbec_cam = True if camera not in ['camera05', 'camera06'] else False
-    conf = 0.35
-    
-    # Build paths relative to script directory
-    base_path = script_dir.parent.parent.parent / "data" / "input"
-    output_path = script_dir.parent.parent / "output" / "test" /  model / f"conf_{conf:.2f}" / camera
+    multi_run = False
 
-    config = PipelineConfig(
-        input_path=str(base_path / "orbbec" / camera),
-        camera_path=str(base_path),
-        output_path=str(output_path),
-        camera_name=camera,
-        orbbec_cam=orbbec_cam,
-        model=model,
-        min_detection_confidence=conf,
-        crop_size=256,
-        bbox_shift=150,
-        max_workers=10,     # Number of threads
-        batch_size=20       # Images per batch
-    )
-    
-    # Create pipeline
-    pipeline = HandDetectionPipeline(config)
+    if multi_run:
+        cameras = {
+            "camera01": 0.5,
+            "camera02": 0.75,
+            "camera03": 0.35,
+            "camera04": 0.5,
+            "camera05": 0.35,
+            "camera06": 0.5
+        }
+        run_start = time.time()
+        for camera, conf in cameras.items():
+            orbbec_cam = True if camera not in ['camera05', 'camera06'] else False
+            # conf = 0.35
+            
+            # Build paths relative to script directory
+            base_path = script_dir.parent.parent.parent / "data" / "input"
+            output_path = script_dir.parent.parent / "output" / "test" /  model / "diff_confs_run" / camera / f"conf_{conf:.2f}"
 
-    start = time.time()
-    
-    # Use multithreaded version
-    # pipeline.run_multithreaded(start_idx=0, end_idx=200)
-    
-    # Alternative: use single-threaded version
-    pipeline.run(start_idx=0, end_idx=20)
-    
-    end = time.time()
-    
-    elapsed_time = end - start
-    pipeline.logger.info(f"Pipeline execution time: {elapsed_time:.2f} seconds")
+            config = PipelineConfig(
+                input_path=str(base_path / "orbbec" / camera),
+                camera_path=str(base_path),
+                output_path=str(output_path),
+                camera_name=camera,
+                orbbec_cam=orbbec_cam,
+                model=model,
+                min_detection_confidence=conf,
+                crop_size=256,
+                bbox_shift=150,
+                max_workers=10,     # Number of threads
+                batch_size=20       # Images per batch
+            )
+            
+            # Create pipeline
+            pipeline = HandDetectionPipeline(config)
+
+            start = time.time()
+            
+            # Use multithreaded version
+            # pipeline.run_multithreaded(start_idx=0, end_idx=200)
+            
+            # Alternative: use single-threaded version
+            pipeline.run(start_idx=0, end_idx=20)
+            
+            end = time.time()
+            
+            elapsed_time = end - start
+            pipeline.logger.info(f"Pipeline execution time: {elapsed_time:.2f} seconds")
+
+        run_end = time.time()
+        run_time = run_end - run_start
+        pipeline.logger.info(f"Entire run execution time: {run_time:.2f} seconds")
+    else:
+        camera = "camera05"
+        orbbec_cam = True if camera not in ['camera05', 'camera06'] else False
+        conf = 0.4
+        min_tracking_confidence = 0.75
+        
+        # Build paths relative to script directory
+        base_path = script_dir.parent.parent.parent / "data" / "input"
+        output_path = script_dir.parent.parent / "output" / "test" /  model / f"conf_{conf:.2f}" / camera 
+
+        config = PipelineConfig(
+            input_path=str(base_path / "orbbec" / camera),
+            camera_path=str(base_path),
+            output_path=str(output_path),
+            camera_name=camera,
+            orbbec_cam=orbbec_cam,
+            model=model,
+            min_detection_confidence=conf,
+            min_tracking_confidence=min_tracking_confidence,
+            crop_size=256,
+            bbox_shift=150,
+            max_workers=10,     # Number of threads
+            batch_size=20       # Images per batch
+        )
+        
+        # Create pipeline
+        pipeline = HandDetectionPipeline(config)
+
+        start = time.time()
+        
+        # Use multithreaded version
+        # pipeline.run_multithreaded(start_idx=0, end_idx=200)
+        
+        # Alternative: use single-threaded version
+        pipeline.run(start_idx=0, end_idx=20)
+        
+        end = time.time()
+        
+        elapsed_time = end - start
+        pipeline.logger.info(f"Pipeline execution time: {elapsed_time:.2f} seconds")
 
 
 if __name__ == "__main__":
-    main() 
+    main()
