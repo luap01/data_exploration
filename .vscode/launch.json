@@ -1,0 +1,21 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/hand_detection/src/main.py",
+            "console": "integratedTerminal",
+            "args": [
+                // "--use_2D_GT", "True",
+                // "--use_GTR", "True",
+                // "--random_mask", "True",
+            ],
+            "justMyCode": true
+        },
+    ]
+}

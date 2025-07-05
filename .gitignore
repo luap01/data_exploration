@@ -2,6 +2,8 @@
 data/
 pytorch-openpose/*
 openpose_impl/model/*
+hand_detection/src/models/openpose_impl/
+
 
 data_exp/
 
@@ -14,3 +16,10 @@ test_*/
 
 **/*.pth
 test.ipynb
+
+**/.venv/**
+
+**/*output*/**
+
+presentation/
+

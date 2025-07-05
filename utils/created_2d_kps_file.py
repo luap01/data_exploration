@@ -1,6 +1,7 @@
 import numpy as np
 import json
 import os
+import cv2
 
 def json_load(p):
     with open(p, 'r') as fi:
@@ -36,17 +37,17 @@ if __name__ == "__main__":
         files = os.listdir(f"{base_path}/{camera_name}/json")
         count = 0
         idx = 0
-        for file in files:
-            if any(substr in file for substr in ['000004', '000012', '000018', '000019']):
+        while idx < 20:
+            if any(substr in f"{idx:06d}" for substr in ['000004', '000012', '000018', '000019']):
+                idx += 1
                 continue
             try:
-                data = json_load(os.path.join(base_path, camera_name, "json", file))
+                data = json_load(os.path.join(base_path, camera_name, "json", f"{idx:06d}_test.json"))
 
                 if len(data["people"]) > 0:
                     res_left = build_arr(data["people"][0], "right" if camera_name != "camera03" else "left")
                     res_right = build_arr(data["people"][0], "left" if camera_name != "camera03" else "right")
                 else:
-                    print(file)
                     count += 1
                     arr = [0] * 63
                     res_right = build_arr(arr)
@@ -66,9 +67,41 @@ if __name__ == "__main__":
                 save_file(res_right, tar_pth_right)
                 save_file(res_left, tar_pth_left)
 
-                idx += 1
             except IndexError:
-                pass
-    
+                print("Error for:", idx)
+            
+            idx += 1
+
+        pics = os.listdir(f"{base_path}/{camera_name}/blanks")
+        pic_tar = tar_base_path.replace("rgb_2D_keypoints", "orbbec")
+        idx = 0
+        while idx < 20:
+            if any(substr in f"{idx:06d}" for substr in ['000004', '000012', '000018', '000019']):
+                idx += 1
+                continue
+            try:
+                res_right = cv2.imread(os.path.join(base_path, camera_name, "blanks", f"{idx:06d}_cropped_256_{'left' if camera_name != 'camera03' else 'right'}_blank.jpg"))
+                res_left = cv2.imread(os.path.join(base_path, camera_name, "blanks", f"{idx:06d}_cropped_256_{'right' if camera_name != 'camera03' else 'left'}_blank.jpg"))
+                orig = cv2.imread(os.path.join(base_path, camera_name, "original", f"{idx:06d}_test.jpg"))
+
+                tar_pth_right = os.path.join(pic_tar, "right", camera_name, f"{idx:06d}.jpg")
+                tar_pth_left = os.path.join(pic_tar, "left", camera_name, f"{idx:06d}.jpg")
+                tar_pth_orig = os.path.join(pic_tar, "orig", camera_name, f"{idx:06d}.jpg")
+
+                # Create directories if they don't exist
+                os.makedirs(os.path.dirname(tar_pth_right), exist_ok=True)
+                os.makedirs(os.path.dirname(tar_pth_left), exist_ok=True)
+                os.makedirs(os.path.dirname(tar_pth_orig), exist_ok=True)
+                
+                cv2.imwrite(tar_pth_right, res_right)
+                cv2.imwrite(tar_pth_left, res_left)
+                cv2.imwrite(tar_pth_orig, orig)
+
+            except IndexError:
+                print("Error for:", idx)
+
+            idx += 1
+
+
     print(count)
     print(idx)

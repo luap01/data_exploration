@@ -3,9 +3,9 @@ import numpy as np
 from utils.files import json_load
 
 
-BASE_PATH_1 = "test_diff_setup_2/camera06"
+BASE_PATH_1 = "hand_detection/output/test/mediapipe/conf_0.50/camera05"
 count = 0
-for i in range(0, 200):
+for i in range(0, 20):
     img_idx = f"{i:06d}"
 
     try:

@@ -4,6 +4,9 @@ from typing import List, Tuple, Optional, Dict, Any
 import sys
 from pathlib import Path
 
+# Always resolve paths relative to this script's location
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 from .hand_detector import HandDetector, HandDetection
 
 from .openpose_impl import model
@@ -20,7 +23,7 @@ class OpenPoseHandDetector(HandDetector):
                  min_detection_confidence: float = 0.0,
                  min_tracking_confidence: float = 0.5,
                  base_model_path: Optional[str] = None):
-        self.base_model_path = base_model_path or './openpose_impl/model/'
+        self.base_model_path = base_model_path or f'{SCRIPT_DIR}/openpose_impl/model/'
         self.max_num_hands = max_num_hands
         self.min_detection_confidence = min_detection_confidence
         self.body_estimation = None
@@ -116,7 +119,8 @@ class OpenPoseHandDetector(HandDetector):
         
         return {
             f"hand_{detection.hand_type}_keypoints_2d": keypoints,
-            f"hand_{detection.hand_type}_shift": [x_min, y_min]
+            f"hand_{detection.hand_type}_shift": [x_min, y_min],
+            f"hand_{detection.hand_type}_conf": [detection.confidence]
         }
     
     def draw_landmarks(self, detection: HandDetection, image: np.array):
@@ -133,6 +137,10 @@ class OpenPoseHandDetector(HandDetector):
         landmarks_array = np.array(landmarks_pixel)
         util.draw_handpose(image, [landmarks_array])
         return image
+
+    def get_hand_center_x(self, detection: HandDetection):
+        """Return the average x position of all landmarks"""
+        return sum([x for (x, _, _) in detection.landmarks]) / len(detection.landmarks)
     
     def release(self):
         """Release OpenPose resources"""

@@ -74,6 +74,18 @@ class HandDetector(ABC):
             image: RGB image as numpy array
         """
         pass
+
+    @abstractmethod
+    def get_hand_center_x(self, detection: HandDetection):
+        """
+        Average x position of all landmarks
+
+        Args:
+            detection: HandDetection object
+        Returns:
+            position: Float value of the x position
+        """
+        pass
     
     def release(self):
         """Release any resources held by the model"""

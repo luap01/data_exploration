@@ -84,7 +84,8 @@ class MediaPipeHandDetector(HandDetector):
         
         return {
             f"hand_{detection.hand_type}_keypoints_2d": keypoints,
-            f"hand_{detection.hand_type}_shift": [x_min, y_min]
+            f"hand_{detection.hand_type}_shift": [x_min, y_min],
+            f"hand_{detection.hand_type}_conf": [detection.confidence]
         }
     
     def draw_landmarks(self, detection: HandDetection, image: np.array):
@@ -111,7 +112,10 @@ class MediaPipeHandDetector(HandDetector):
             self.mp_drawing_styles.get_default_hand_connections_style()
         )
         return image
-        
+    
+    def get_hand_center_x(self, detection: HandDetection):
+        """Return the average x position of all landmarks"""
+        return sum([x for (x, _, _) in detection.landmarks]) / len(detection.landmarks)
 
     def release(self):
         """Release MediaPipe resources"""
